@@ -82,7 +82,12 @@ dnsmasq 的动态 ECS 缓存行为依赖版本。目标是每个客户端的上�
 - tag: domain_index
   type: domain_mapping
   args:
-    size: 65536
+    size: 262144
+    retention:
+      mode: lru
+      ttl_multiplier: 10
+      min_window: 300 # 秒
+      max_window: 86400 # 秒
     api:
       max_concurrent: 128
       timeout: 1000 # 毫秒
@@ -91,7 +96,27 @@ dnsmasq 的动态 ECS 缓存行为依赖版本。目标是每个客户端的上�
       size: 65536
 ```
 
-`size` 是观察记录上限，默认 65536；每个客户端、域名、IP、来源组合占一个记录。容量满时淘汰最久未观察的记录；全局索引复用这些记录。索引仅保存在内存中，重启后由新 DNS 应答重建。
+`size` 是观察记录上限；每个客户端、域名、IP、来源组合占一个记录，全局索引复用这些记录。未设置 `size` 时，旧版 `ttl` 模式默认 65536，`sliding` / `lru` 模式默认 **262144**。此数值是 Mihomo 内置 4096 的 64 倍，但两者计数单位不同，不能解释为 64 倍独立 IP。索引仅保存在内存中，重启后由新 DNS 应答重建。
+
+### DNS 到期、路由续期与容量淘汰
+
+`retention` 省略时保持旧版严格 TTL 行为。上面的部署示例显式启用 `lru`，解决客户端继续使用 TTL 已过期地址、以及 lazy cache 最终应答 TTL 仅 5 秒时映射很快消失的问题；不修改实际 DNS 应答的 TTL。
+
+| `retention.mode` | 时间与容量行为 |
+| --- | --- |
+| `ttl`（默认） | 按最终 DNS 应答 TTL 到期删除，查询不续期；容量满时淘汰最久未观察的记录。TTL=0 不登记。 |
+| `sliding` | 客户端路由命中续期，窗口届满删除；容量满时按访问 LRU 淘汰。 |
+| `lru`（推荐） | 客户端路由命中续期；窗口届满后记录仍可命中，仅由容量 LRU 淘汰。TTL=0 也登记。 |
+
+新模式的路由窗口为 `clamp(baseTTL × ttl_multiplier, min_window, max_window)`。后三项省略或为 0 时使用默认值 **10 / 300 秒 / 86400 秒**。参数必须非负、上下限合法且不能溢出；`baseTTL` 至少为 1 秒，同一记录重复收到较短 TTL 不降低已经保存的基准 TTL。命中时路由截止取 `max(原截止, 当前时间 + 窗口)`：TTL 为 300 秒时，每次同客户端路由查询命中都延至至少请求时间的 3000 秒后；lazy TTL 为 5 秒时由下限提供至少 300 秒窗口。`max_window` 只限制计算出的单次窗口，**不限制 LRU 证据总寿命**。如需要时间硬截止，应选择 `sliding` 或 `ttl`。
+
+只有 `view=route` 表示连接选路访问。客户端命中刷新该记录的有效期和访问 LRU；全局回退仅刷新访问 LRU，为本次响应计算有效期，不延长 DNS 所属客户端的存储有效期、不创建查询客户端的观察记录。`view=full`、默认诊断查询和 stats 均不续期、不提升 LRU；LRU 诊断可为当前响应计算有效期，不代表改变了索引寿命。已有长连接的数据包和 HTTP/2 请求不会逐次查桥接，续期发生在新 TCP 连接或新 UDP NAT 会话的查询时。
+
+DNS 观察顺序与访问 LRU 相互独立。只有实际最终 DNS 应答能更新 `observed_at` 和域名选择顺序；命中续期不能把热点旧域名推到新 DNS 观察之前。保留期内多个域名共享 IP 时仍按最近 DNS 观察选择，`conflict=true`；延长保留不消除共享 CDN IP 的歧义。
+
+新模式在 v1 应答中增加可选 `dns_expires_at`（最近应答的真实 DNS 截止）、`dns_stale`（查询时已过 DNS 截止）和 `retention_mode`。原 `expires_at` 表示路由证据有效期，旧 Mihomo 仍可验证并使用。严格 TTL 模式不添加这些字段，保留旧协议。Mihomo 不缓存完成后的查询，因此每个新连接仍可看到新的域名归属。新模式 stats 另提供 `retention_mode`、`observation_capacity`、`retention_renewals` 和 `retention_touches`；续期与触碰计数不是客户端业务 HTTP 请求数。
+
+`sliding` / `lru` 当前不能与 `allocation.enable: true` 同时使用，启动时会拒绝该组合：路由证据续期与真实地址分配租约是不同机制。生产模板保持分配关闭。实现依据、固定版本源码与资源测量说明见 [retention.md](retention.md)。
 
 ```text
 GET /plugins/domain_index/v1/lookup?ip=203.0.113.8&client=192.168.10.20
@@ -101,7 +126,7 @@ GET /plugins/domain_index/v1/stats
 
 `ip` 必填，`client` 可选，均为 IP 字面量。`view` 可选，只接受 `full` 或 `route`；省略时为 `full`。这些字段的非法或重复参数返回 HTTP 400；有效查询返回 HTTP 200 与 `status: hit|miss`。客户端索引优先，未命中查全局；多个域名共享地址时选择最近观察的域名，并返回冲突信息。时间使用 RFC3339Nano。
 
-`view=route` 在 hit 和 miss 时均省略整个 `candidates` 字段，其他顶层字段与同一时刻的完整查询一致。新 Mihomo 始终请求此精简视图；旧 MosDNS 忽略该参数并返回完整 v1 响应时，新 Mihomo 仍能使用，因此不需要能力探测或额外往返。默认视图及 `view=full` 保留原有诊断响应。
+`view=route` 在 hit 和 miss 时均省略整个 `candidates` 字段，与完整查询选择同一域名和冲突状态；在新保留模式下它还表示真实路由访问，可能续期及提升 LRU，而完整查询只诊断。新 Mihomo 始终请求此精简视图；旧 MosDNS 忽略该参数并返回完整 v1 响应时，新 Mihomo 仍能使用，因此不需要能力探测或额外往返。默认视图及 `view=full` 保留诊断用途。
 
 每个客户端/IP 及全局/IP 索引分别维护观察顺序和不同域名的有效记录计数，精简查询直接读取最新有效记录及冲突状态，不扫描全部候选。更新、刷新、过期和容量淘汰同步维护这些索引。观察记录的过期清理仍有实际工作量：API 每批最多清理 128 条观察记录并释放锁、检查取消，避免整批过期始终占住 DNS 登记所用的锁；普通 DNS 登记也只进行有界的观察记录清理。没有过期积压时，路由记录选择为常数时间。
 

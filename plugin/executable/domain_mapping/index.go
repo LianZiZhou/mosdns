@@ -22,6 +22,7 @@ type observation struct {
 	heapPos      int
 	order        *list.Element
 	bucketOrders [2]*list.Element
+	baseTTL      time.Duration
 }
 
 type observationHeap []*observation
@@ -46,18 +47,20 @@ func (h *observationHeap) Pop() any {
 }
 
 type observationIndex struct {
-	size     int
-	sequence uint64
-	records  map[observationKey]*observation
-	buckets  map[lookupKey]*observationBucket
-	expiry   observationHeap
-	order    list.List
+	size      int
+	sequence  uint64
+	records   map[observationKey]*observation
+	buckets   map[lookupKey]*observationBucket
+	expiry    observationHeap
+	order     list.List
+	retention RetentionArgs
 }
 
 // Every observation belongs to its client bucket and the global bucket. Each
-// bucket keeps the same recency order as the index, plus reference counts for
-// distinct domains. Route queries can therefore select and detect conflicts
-// without scanning all records sharing an address.
+// bucket keeps real DNS observation order, plus reference counts for distinct
+// domains. Extended retention tracks route access separately in the index's
+// capacity LRU. Route queries select and detect conflicts without scanning
+// all records sharing an address or changing DNS ownership on access.
 type observationBucket struct {
 	order   list.List
 	domains map[string]int
@@ -100,8 +103,16 @@ func (s *observationIndex) remove(o *observation) {
 			delete(s.buckets, key)
 		}
 	}
-	heap.Remove(&s.expiry, o.heapPos)
+	if o.heapPos >= 0 {
+		heap.Remove(&s.expiry, o.heapPos)
+	}
 	s.order.Remove(o.order)
+}
+
+func (s *observationIndex) fixExpiry(o *observation) {
+	if o.heapPos >= 0 {
+		heap.Fix(&s.expiry, o.heapPos)
+	}
 }
 
 func (s *observationIndex) expire(now time.Time) {
@@ -122,13 +133,25 @@ func (s *observationIndex) expireBatch(now time.Time, limit int) bool {
 func (s *observationIndex) put(client, ip netip.Addr, candidate Candidate) uint64 {
 	key := observationKey{lookupKey: lookupKey{client: client, ip: ip}, domain: candidate.Domain, source: candidate.Source}
 	s.sequence++
+	var baseTTL time.Duration
+	if s.retention.extended() {
+		if candidate.DNSExpiresAt != nil {
+			baseTTL = candidate.DNSExpiresAt.Sub(candidate.ObservedAt)
+		}
+		baseTTL = max(baseTTL, time.Second)
+		if o := s.records[key]; o != nil {
+			baseTTL = max(baseTTL, o.baseTTL)
+		}
+		candidate.ExpiresAt = candidate.ObservedAt.Add(s.retention.window(baseTTL))
+	}
 	if o := s.records[key]; o != nil {
 		// A shorter new answer does not invalidate an earlier client cache.
 		if candidate.ExpiresAt.Before(o.ExpiresAt) {
 			candidate.ExpiresAt = o.ExpiresAt
 		}
 		o.Candidate, o.sequence = candidate, s.sequence
-		heap.Fix(&s.expiry, o.heapPos)
+		o.baseTTL = baseTTL
+		s.fixExpiry(o)
 		s.order.MoveToBack(o.order)
 		keys, n := observationBucketKeys(key.lookupKey)
 		for i, bucketKey := range keys[:n] {
@@ -147,10 +170,12 @@ func (s *observationIndex) put(client, ip netip.Addr, candidate Candidate) uint6
 			evicted = 1
 		}
 	}
-	o := &observation{key: key, Candidate: candidate, sequence: s.sequence}
+	o := &observation{key: key, Candidate: candidate, sequence: s.sequence, heapPos: -1, baseTTL: baseTTL}
 	o.order = s.order.PushBack(o)
 	s.records[key] = o
-	heap.Push(&s.expiry, o)
+	if s.retention.Mode != retentionLRU {
+		heap.Push(&s.expiry, o)
+	}
 	keys, n := observationBucketKeys(key.lookupKey)
 	for i, bucketKey := range keys[:n] {
 		bucket := s.buckets[bucketKey]
@@ -173,17 +198,29 @@ func (s *observationIndex) candidates(key lookupKey) []Candidate {
 // whether the bucket exists. The caller must first finish expiry at its lookup
 // time; otherwise both selection and conflict could include expired evidence.
 func (s *observationIndex) route(key lookupKey) (candidate Candidate, conflict, found bool) {
-	bucket := s.buckets[key]
-	if bucket == nil {
+	o, conflict := s.routeObservation(key)
+	if o == nil {
 		return Candidate{}, false, false
 	}
-	return bucket.order.Back().Value.(*observation).Candidate, len(bucket.domains) > 1, true
+	return o.Candidate, conflict, true
+}
+
+func (s *observationIndex) routeObservation(key lookupKey) (*observation, bool) {
+	bucket := s.buckets[key]
+	if bucket == nil {
+		return nil, false
+	}
+	return bucket.order.Back().Value.(*observation), len(bucket.domains) > 1
 }
 
 // Diagnostics retain the newest observation for up to 32 distinct domains.
 // Repeated records of one domain may still require walking a large bucket; the
 // route view avoids this entirely, and diagnostic walks check cancellation.
 func (s *observationIndex) candidatesContext(ctx context.Context, key lookupKey) ([]Candidate, error) {
+	return s.candidatesContextAt(ctx, key, time.Time{})
+}
+
+func (s *observationIndex) candidatesContextAt(ctx context.Context, key lookupKey, now time.Time) ([]Candidate, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -207,7 +244,11 @@ func (s *observationIndex) candidatesContext(ctx context.Context, key lookupKey)
 			continue
 		}
 		seen[o.Domain] = struct{}{}
-		result = append(result, o.Candidate)
+		if now.IsZero() {
+			result = append(result, o.Candidate)
+		} else {
+			result = append(result, s.retentionCandidate(o, now))
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

@@ -8,7 +8,12 @@ plugins:
   - tag: domain_index
     type: domain_mapping
     args:
-      size: 65536
+      size: 262144 # 观察记录数，包含客户端/IP/域名/来源；不是独立 IP 数。
+      retention:
+        mode: lru # DNS 到期后仍保留，直到容量 LRU 淘汰；省略配置则保持旧版 ttl 模式。
+        ttl_multiplier: 10
+        min_window: 300 # 路由有效期下限，秒，覆盖 lazy answer 的 5 秒 TTL。
+        max_window: 86400 # 单次路由窗口上限，秒；不是 LRU 记录的硬截止。
       api:
         max_concurrent: 128 # lookup/stats 共用的活动请求上限，超额立即拒绝并尝试返回 503。
         timeout: 1000 # 毫秒；Mihomo 仍使用自己的 50 ms 查询预算。

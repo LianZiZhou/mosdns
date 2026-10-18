@@ -28,6 +28,7 @@ type Args struct {
 	Size       int            `yaml:"size"`
 	Allocation AllocationArgs `yaml:"allocation"`
 	API        APIArgs        `yaml:"api"`
+	Retention  RetentionArgs  `yaml:"retention"`
 }
 
 type APIArgs struct {
@@ -41,38 +42,48 @@ type AllocationArgs struct {
 }
 
 type Candidate struct {
-	Domain     string    `json:"domain"`
-	Source     string    `json:"source"`
-	ObservedAt time.Time `json:"observed_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	Domain        string     `json:"domain"`
+	Source        string     `json:"source"`
+	ObservedAt    time.Time  `json:"observed_at"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+	DNSExpiresAt  *time.Time `json:"dns_expires_at,omitempty"`
+	DNSStale      bool       `json:"dns_stale,omitempty"`
+	RetentionMode string     `json:"retention_mode,omitempty"`
 }
 
 type LookupResult struct {
-	Version    int         `json:"version"`
-	Status     string      `json:"status"`
-	IP         string      `json:"ip"`
-	Domain     string      `json:"domain,omitempty"`
-	Scope      string      `json:"scope"`
-	Source     string      `json:"source,omitempty"`
-	ObservedAt *time.Time  `json:"observed_at,omitempty"`
-	ExpiresAt  *time.Time  `json:"expires_at,omitempty"`
-	Conflict   bool        `json:"conflict"`
-	Candidates []Candidate `json:"candidates"`
+	Version       int         `json:"version"`
+	Status        string      `json:"status"`
+	IP            string      `json:"ip"`
+	Domain        string      `json:"domain,omitempty"`
+	Scope         string      `json:"scope"`
+	Source        string      `json:"source,omitempty"`
+	ObservedAt    *time.Time  `json:"observed_at,omitempty"`
+	ExpiresAt     *time.Time  `json:"expires_at,omitempty"`
+	DNSExpiresAt  *time.Time  `json:"dns_expires_at,omitempty"`
+	DNSStale      bool        `json:"dns_stale,omitempty"`
+	RetentionMode string      `json:"retention_mode,omitempty"`
+	Conflict      bool        `json:"conflict"`
+	Candidates    []Candidate `json:"candidates"`
 }
 
 type Stats struct {
-	Observations      int       `json:"observations"`
-	ObservationEvicts uint64    `json:"observation_evictions"`
-	AllocationEnabled bool      `json:"allocation_enabled"`
-	Leases            int       `json:"leases"`
-	Allocated         uint64    `json:"allocated"`
-	Unsafe            uint64    `json:"allocation_unsafe"`
-	Exhausted         uint64    `json:"allocation_exhausted"`
-	Capacity          uint64    `json:"allocation_capacity"`
-	BlockedUntil      time.Time `json:"allocation_blocked_until"`
-	APIActive         int64     `json:"api_active"`
-	APIRejected       uint64    `json:"api_rejected"`
-	APITimeouts       uint64    `json:"api_timeouts"`
+	Observations        int       `json:"observations"`
+	ObservationEvicts   uint64    `json:"observation_evictions"`
+	AllocationEnabled   bool      `json:"allocation_enabled"`
+	Leases              int       `json:"leases"`
+	Allocated           uint64    `json:"allocated"`
+	Unsafe              uint64    `json:"allocation_unsafe"`
+	Exhausted           uint64    `json:"allocation_exhausted"`
+	Capacity            uint64    `json:"allocation_capacity"`
+	BlockedUntil        time.Time `json:"allocation_blocked_until"`
+	APIActive           int64     `json:"api_active"`
+	APIRejected         uint64    `json:"api_rejected"`
+	APITimeouts         uint64    `json:"api_timeouts"`
+	ObservationCapacity int       `json:"observation_capacity,omitempty"`
+	RetentionMode       string    `json:"retention_mode,omitempty"`
+	RetentionRenewals   uint64    `json:"retention_renewals,omitempty"`
+	RetentionTouches    uint64    `json:"retention_touches,omitempty"`
 }
 
 type DomainMapping struct {
@@ -104,6 +115,12 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func New(args Args) (*DomainMapping, error) {
+	if err := args.Retention.normalize(); err != nil {
+		return nil, err
+	}
+	if args.Allocation.Enable && args.Retention.extended() {
+		return nil, fmt.Errorf("domain_mapping allocation requires retention mode ttl")
+	}
 	if args.Size < 0 || args.Allocation.Size < 0 {
 		return nil, fmt.Errorf("domain_mapping sizes must not be negative")
 	}
@@ -118,14 +135,22 @@ func New(args Args) (*DomainMapping, error) {
 	}
 	if args.Size == 0 {
 		args.Size = 65536
+		if args.Retention.extended() {
+			args.Size = 262144
+		}
 	}
 	if args.Allocation.Size == 0 {
 		args.Allocation.Size = args.Size
 	}
 	p := &DomainMapping{args: args, now: time.Now, mu: newContextMutex(), apiSlots: semaphore.NewWeighted(int64(args.API.MaxConcurrent))}
 	p.index.init(args.Size)
+	p.index.retention = args.Retention
 	p.alloc.init(args.Allocation.Size)
 	p.stats.AllocationEnabled = args.Allocation.Enable
+	if args.Retention.extended() {
+		p.stats.RetentionMode = args.Retention.Mode
+		p.stats.ObservationCapacity = args.Size
+	}
 	return p, nil
 }
 
@@ -203,13 +228,18 @@ func (p *DomainMapping) observe(domain string, client netip.Addr, r *dns.Msg, no
 		p.rememberLease(leaseKey{domain: domain}, now.Add(time.Duration(serviceTTL)*time.Second))
 	}
 	for _, e := range evidence {
-		if e.ttl == 0 {
+		if e.ttl == 0 && !p.args.Retention.extended() {
 			continue
 		}
 		expires := now.Add(time.Duration(e.ttl) * time.Second)
-		p.stats.ObservationEvicts += p.index.put(client, e.ip, Candidate{
+		candidate := Candidate{
 			Domain: domain, Source: e.source, ObservedAt: now, ExpiresAt: expires,
-		})
+		}
+		if p.args.Retention.extended() {
+			candidate.DNSExpiresAt = &expires
+			candidate.RetentionMode = p.args.Retention.Mode
+		}
+		p.stats.ObservationEvicts += p.index.put(client, e.ip, candidate)
 		if p.args.Allocation.Enable {
 			p.rememberLease(leaseKey{domain: domain, ip: e.ip}, expires)
 		}
@@ -254,20 +284,48 @@ func (p *DomainMapping) lookupContext(ctx context.Context, ip, client netip.Addr
 	result := LookupResult{Version: 1, Status: "miss", IP: ip.String(), Scope: "global", Candidates: []Candidate{}}
 	var selected Candidate
 	var found bool
+	now := p.now()
 	if routeOnly {
+		// A request may have expired after it acquired the lock (or while
+		// reading its clock). Reject known cancellation before renewing
+		// evidence; a late timer callback must not turn timeout into use.
+		if err := ctx.Err(); err != nil {
+			return LookupResult{}, err
+		}
+		if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+			return LookupResult{}, context.DeadlineExceeded
+		}
+		var observation *observation
 		if client.IsValid() {
-			selected, result.Conflict, found = p.index.route(lookupKey{client: client, ip: ip})
+			observation, result.Conflict = p.index.routeObservation(lookupKey{client: client, ip: ip})
+			found = observation != nil
 			if found {
 				result.Scope = "client"
+				if p.args.Retention.extended() {
+					if p.index.touchRoute(observation, now) {
+						p.stats.RetentionRenewals++
+					}
+					p.stats.RetentionTouches++
+				}
 			}
 		}
 		if !found {
-			selected, result.Conflict, found = p.index.route(lookupKey{ip: ip})
+			observation, result.Conflict = p.index.routeObservation(lookupKey{ip: ip})
+			found = observation != nil
+			if found && p.args.Retention.extended() {
+				// Global evidence may stay hot in the shared capacity LRU,
+				// but cannot renew another client's lease or DNS ownership.
+				p.index.order.MoveToBack(observation.order)
+				p.stats.RetentionTouches++
+			}
+		}
+		if found {
+			selected = p.index.retentionCandidate(observation, now)
 		}
 	} else {
 		var err error
 		if client.IsValid() {
-			result.Candidates, err = p.index.candidatesContext(ctx, lookupKey{client: client, ip: ip})
+			result.Candidates, err = p.index.candidatesContextAt(ctx, lookupKey{client: client, ip: ip}, now)
 			if err != nil {
 				return LookupResult{}, err
 			}
@@ -276,7 +334,7 @@ func (p *DomainMapping) lookupContext(ctx context.Context, ip, client netip.Addr
 			}
 		}
 		if len(result.Candidates) == 0 {
-			result.Candidates, err = p.index.candidatesContext(ctx, lookupKey{ip: ip})
+			result.Candidates, err = p.index.candidatesContextAt(ctx, lookupKey{ip: ip}, now)
 			if err != nil {
 				return LookupResult{}, err
 			}
@@ -289,6 +347,7 @@ func (p *DomainMapping) lookupContext(ctx context.Context, ip, client netip.Addr
 	if found {
 		result.Status, result.Domain, result.Source = "hit", selected.Domain, selected.Source
 		result.ObservedAt, result.ExpiresAt = &selected.ObservedAt, &selected.ExpiresAt
+		result.DNSExpiresAt, result.DNSStale, result.RetentionMode = selected.DNSExpiresAt, selected.DNSStale, selected.RetentionMode
 	}
 	if err := ctx.Err(); err != nil {
 		return LookupResult{}, err
