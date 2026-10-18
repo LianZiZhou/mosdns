@@ -397,11 +397,14 @@ func (p *DomainMapping) beginAPI(w http.ResponseWriter, req *http.Request) (cont
 	w.Header().Set("Cache-Control", "no-store")
 	ctx, cancel := context.WithTimeout(req.Context(), time.Duration(p.args.API.Timeout)*time.Millisecond)
 	deadline, _ := ctx.Deadline()
-	// A context alone cannot interrupt ResponseWriter.Write. Keep the deadline
-	// installed through the server's final buffered flush, including rejections;
-	// net/http resets it after finishing the response. ResponseRecorder and
-	// non-network test writers may not support deadlines.
-	_ = http.NewResponseController(w).SetWriteDeadline(deadline)
+	// A context cannot interrupt ResponseWriter.Write or net/http's automatic
+	// draining of an unread request body, even on GET. Keep both deadlines
+	// installed through the server's final flush and body.Close, including
+	// rejections. net/http resets them before reusing the connection.
+	// ResponseRecorder and non-network writers may not support deadlines.
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(deadline)
+	_ = controller.SetWriteDeadline(deadline)
 	if err := ctx.Err(); err != nil {
 		cancel()
 		p.apiError(w, err)

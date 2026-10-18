@@ -139,7 +139,7 @@ miss 缺省命中字段，返回 `conflict: false`；完整视图还返回 `cand
 
 ### API 与连接资源限制
 
-`api.max_concurrent` 默认 128，`lookup` 和 `stats` 共用，达到上限的新请求立即尝试返回 HTTP 503，不再排队等待索引锁。`api.timeout` 默认 1000 毫秒；省略或填写 `0` 使用默认值，负数无效。索引锁等待、查询和分批过期清理响应请求取消及截止时间，应答写入使用同一绝对截止时间，拒绝响应也受到写入截止时间约束。查询超时也尝试返回 HTTP 503；但截止时间已到或应答已开始写入时，服务端可能只能终止写入，客户端收到连接关闭或不完整应答，不能保证 503 送达，也不能改写已经发出的状态。这里限制的是插件 handler 中的请求，不是 MosDNS 整个 HTTP 服务器的 socket 总数，也不是调度延迟的硬实时保证。
+`api.max_concurrent` 默认 128，`lookup` 和 `stats` 共用，达到上限的新请求立即尝试返回 HTTP 503，不再排队等待索引锁。`api.timeout` 默认 1000 毫秒；省略或填写 `0` 使用默认值，负数无效。索引锁等待、查询和分批过期清理响应请求取消及截止时间，应答写入与 HTTP 服务自动读取未消费请求体使用同一绝对截止时间，包括 GET 的 Content-Length、chunked 数据及 trailer；拒绝响应也受到同一读写截止时间约束。截止时间保留至 handler 返回后的最终写入和请求体关闭，正常完成后由 HTTP 服务重置，保持后续 keepalive 请求可用。查询超时也尝试返回 HTTP 503；但截止时间已到或应答已开始写入时，服务端可能只能终止写入，客户端收到连接关闭或不完整应答，不能保证 503 送达，也不能改写已经发出的状态。这里限制的是插件 handler 中的请求，不是 MosDNS 整个 HTTP 服务器的 socket 总数，也不覆盖进入 handler 之前读取请求头的时间，更不是调度延迟的硬实时保证。
 
 Mihomo 的默认预算仍为 50 毫秒，连接等待、建立 TCP/TLS、HTTP 读写、解析及多个 provider 共用原始截止时间。`max-connections` 默认 16，限制每个 provider 的连接；`max-inflight` 默认 128，限制当前运行时尚未结束的共享查询，包括等待连接和已经超时但尚未退出的工作。相同客户端/IP 的有效在途查询仍可共享；容量满时不同的新查询立即回退，不增加无限等待队列。两项填写 `0` 使用默认值，负数无效。
 
@@ -199,6 +199,7 @@ python3 scripts/domain_bridge_smoke.py \
 | WSL Linux amd64 + 真实 dnsmasq 2.92 | TCP 1000/1000、UDP 100/100；ECS 策略、缓存隔离、TCP DNS、截断与 HTTPS Additional、route/full、到期、重载、旧 API 兼容及原嗅探回退全部通过 |
 | Linux arm64 与 mipsle softfloat | 两个内核均交叉编译成功，尚未设备运行 |
 | 实际 `net.Pipe` 阻塞写入 | 完整响应 handler 写入和精简响应最终 flush 均受截止时间约束，keepalive 后续响应不受旧截止时间影响 |
+| 真实 TCP 未完成 GET 请求体 | full/route/stats 的 Content-Length、chunked 数据及 trailer 均受读取截止时间约束；过载拒绝可结束，API 名额可回收，完整请求体仍支持 keepalive 复用 |
 | Go race detector / OpenWRT 透明代理现场 | 未验证 |
 
 DNS 反向映射仍有歧义：共享 CDN IP、同客户端同 IP 多域名、应用自带 DoH、未经过 MosDNS 的缓存、IPv4/IPv6 身份差异，以及 HTTP/2 或 HTTP/3 连接复用都可能影响判定。UDP 沿用 Mihomo 按源 IP＋端口复用 NAT 会话的机制，同一 socket 发往多个目标不会逐目标重新选路。桥接不解密 ECH，也不按已建立连接中的每个请求重新分流。
