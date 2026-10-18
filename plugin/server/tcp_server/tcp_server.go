@@ -41,11 +41,12 @@ func init() {
 }
 
 type Args struct {
-	Entry       string `yaml:"entry"`
-	Listen      string `yaml:"listen"`
-	Cert        string `yaml:"cert"`
-	Key         string `yaml:"key"`
-	IdleTimeout int    `yaml:"idle_timeout"`
+	TrustedECS  []string `yaml:"trusted_ecs"`
+	Entry       string   `yaml:"entry"`
+	Listen      string   `yaml:"listen"`
+	Cert        string   `yaml:"cert"`
+	Key         string   `yaml:"key"`
+	IdleTimeout int      `yaml:"idle_timeout"`
 }
 
 func (a *Args) init() {
@@ -68,7 +69,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func StartServer(bp *coremain.BP, args *Args) (*TcpServer, error) {
-	dh, err := server_utils.NewHandler(bp, args.Entry)
+	dh, err := server_utils.NewHandler(bp, args.Entry, args.TrustedECS...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init dns handler, %w", err)
 	}

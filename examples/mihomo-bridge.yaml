@@ -1,0 +1,76 @@
+# 部署模板：替换两个文档示例上游地址和客户端网段。
+log:
+  level: info
+api:
+  http: 127.0.0.1:9091
+
+plugins:
+  - tag: domain_index
+    type: domain_mapping
+    args:
+      size: 65536
+      allocation:
+        enable: false
+        size: 65536
+
+  - tag: cache_a
+    type: cache
+    args:
+      size: 4096
+      lazy_cache_ttl: 86400
+      # 落盘时每个策略使用独立新文件，目录须可写。
+      # dump_file: /var/lib/mosdns/policy-a-v1.dump
+  - tag: cache_b
+    type: cache
+    args:
+      size: 4096
+      lazy_cache_ttl: 86400
+      # dump_file: /var/lib/mosdns/policy-b-v1.dump
+
+  - tag: upstream_a
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://192.0.2.53:53 # 必须替换：文档示例地址
+  - tag: upstream_b
+    type: forward
+    args:
+      upstreams:
+        - addr: udp://198.51.100.53:53 # 必须替换：文档示例地址
+
+  - tag: policy_a
+    type: sequence
+    args:
+      - exec: $cache_a
+      - matches: has_resp
+        exec: accept
+      - exec: $upstream_a
+  - tag: policy_b
+    type: sequence
+    args:
+      - exec: $cache_b
+      - matches: has_resp
+        exec: accept
+      - exec: $upstream_b
+
+  - tag: main
+    type: sequence
+    args:
+      # 必须位于缓存、fallback、应答变换和策略分支外层。
+      - exec: $domain_index
+      - matches: client_ip 192.168.10.0/24 fd00:10::/64
+        exec: goto policy_a
+      - exec: goto policy_b
+
+  - tag: udp
+    type: udp_server
+    args:
+      entry: main
+      listen: 127.0.0.1:5335
+      trusted_ecs: [127.0.0.1/32]
+  - tag: tcp
+    type: tcp_server
+    args:
+      entry: main
+      listen: 127.0.0.1:5335
+      trusted_ecs: [127.0.0.1/32]

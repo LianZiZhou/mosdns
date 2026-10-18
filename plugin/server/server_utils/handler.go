@@ -21,6 +21,7 @@ package server_utils
 
 import (
 	"fmt"
+	"net/netip"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
 	"github.com/IrineSistiana/mosdns/v5/pkg/server"
@@ -28,7 +29,11 @@ import (
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 )
 
-func NewHandler(bp *coremain.BP, entry string) (server.Handler, error) {
+func NewHandler(bp *coremain.BP, entry string, trustedECS ...string) (server.Handler, error) {
+	prefixes, err := parseTrustedECS(trustedECS)
+	if err != nil {
+		return nil, err
+	}
 	p := bp.M().GetPlugin(entry)
 	exec := sequence.ToExecutable(p)
 	if exec == nil {
@@ -36,8 +41,28 @@ func NewHandler(bp *coremain.BP, entry string) (server.Handler, error) {
 	}
 
 	handlerOpts := server_handler.EntryHandlerOpts{
-		Logger: bp.L(),
-		Entry:  exec,
+		Logger:     bp.L(),
+		Entry:      exec,
+		TrustedECS: prefixes,
 	}
 	return server_handler.NewEntryHandler(handlerOpts), nil
+}
+
+func parseTrustedECS(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid trusted_ecs CIDR %q: %w", value, err)
+		}
+		// Transport addresses are normalized with Unmap before matching.
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				return nil, fmt.Errorf("invalid trusted_ecs CIDR %q: mapped IPv4 prefix is shorter than /96", value)
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }

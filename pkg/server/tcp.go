@@ -27,7 +27,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"go.uber.org/zap"
 )
@@ -83,7 +82,7 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 				} else {
 					c.SetReadDeadline(time.Now().Add(idleTimeout))
 				}
-				req, _, err := dnsutils.ReadMsgFromTCP(c)
+				req, err := readQueryFromTCP(c)
 				if err != nil {
 					return // read err, close the connection
 				}
@@ -101,7 +100,7 @@ func ServeTCP(l net.Listener, h Handler, opts TCPServerOpts) error {
 					if ok {
 						clientAddr = ta.AddrPort().Addr()
 					}
-					r := h.Handle(tcpConnCtx, req, QueryMeta{ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
+					r := h.Handle(tcpConnCtx, req, QueryMeta{PeerAddr: clientAddr, ClientAddr: clientAddr, ServerName: serverName}, pool.PackTCPBuffer)
 					if r == nil {
 						c.Close() // abort the connection
 						return

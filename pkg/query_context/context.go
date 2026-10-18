@@ -239,6 +239,16 @@ func (ctx *Context) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	if clientAddr := ctx.ServerMeta.ClientAddr; clientAddr.IsValid() {
 		zap.Stringer("client", clientAddr).AddTo(encoder)
 	}
+	if peerAddr := ctx.ServerMeta.PeerAddr; peerAddr.IsValid() {
+		zap.Stringer("peer", peerAddr).AddTo(encoder)
+	}
+	source := "transport"
+	if ctx.ServerMeta.ClientAddrFromECS {
+		source = "ecs"
+	} else if ctx.ServerMeta.ClientAddr.IsValid() && ctx.ServerMeta.ClientAddr != ctx.ServerMeta.PeerAddr {
+		source = "provided"
+	}
+	encoder.AddString("client_source", source)
 
 	question := ctx.query.Question[0]
 	encoder.AddString("qname", question.Name)

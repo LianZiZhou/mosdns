@@ -42,7 +42,8 @@ func init() {
 }
 
 type Args struct {
-	Entries []struct {
+	TrustedECS []string `yaml:"trusted_ecs"`
+	Entries    []struct {
 		Exec string `yaml:"exec"`
 		Path string `yaml:"path"`
 	} `yaml:"entries"`
@@ -74,7 +75,7 @@ func Init(bp *coremain.BP, args any) (any, error) {
 func StartServer(bp *coremain.BP, args *Args) (*HttpServer, error) {
 	mux := http.NewServeMux()
 	for _, entry := range args.Entries {
-		dh, err := server_utils.NewHandler(bp, entry.Exec)
+		dh, err := server_utils.NewHandler(bp, entry.Exec, args.TrustedECS...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to init dns handler, %w", err)
 		}

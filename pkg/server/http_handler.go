@@ -95,6 +95,7 @@ func (h *HttpHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	queryMeta := QueryMeta{
+		PeerAddr:   addrPort.Addr(),
 		ClientAddr: clientAddr,
 	}
 	if u := req.URL; u != nil {
@@ -169,8 +170,8 @@ func ReadMsgFromReq(req *http.Request) (*dns.Msg, error) {
 		return nil, fmt.Errorf("unsupported method: %s", req.Method)
 	}
 
-	m := new(dns.Msg)
-	if err := m.Unpack(b); err != nil {
+	m, err := unpackQuery(b)
+	if err != nil {
 		return nil, fmt.Errorf("failed to unpack msg [%x], %w", b, err)
 	}
 	return m, nil

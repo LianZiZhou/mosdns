@@ -22,8 +22,14 @@ type Handler interface {
 type QueryMeta struct {
 	FromUDP bool
 
-	// Optional
+	// PeerAddr is the transport peer, never an address from a request header or ECS.
+	PeerAddr netip.Addr
+	// ClientAddr is the effective client identity used by all plugins.
 	ClientAddr netip.Addr
+	// ClientAddrFromECS reports whether trusted, full-length ECS restored ClientAddr.
+	ClientAddrFromECS bool
+
+	// Optional
 	ServerName string
 	UrlPath    string
 }

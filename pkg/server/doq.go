@@ -26,7 +26,6 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/IrineSistiana/mosdns/v5/pkg/dnsutils"
 	"github.com/IrineSistiana/mosdns/v5/pkg/pool"
 	"github.com/quic-go/quic-go"
 	"go.uber.org/zap"
@@ -100,11 +99,12 @@ func ServeDoQ(l *quic.Listener, h Handler, opts DoQServerOpts) error {
 					}()
 					// Avoid fragmentation attack.
 					stream.SetReadDeadline(time.Now().Add(streamReadTimeout))
-					req, _, err := dnsutils.ReadMsgFromTCP(stream)
+					req, err := readQueryFromTCP(stream)
 					if err != nil {
 						return
 					}
 					queryMeta := QueryMeta{
+						PeerAddr:   clientAddr,
 						ClientAddr: clientAddr,
 						ServerName: c.ConnectionState().TLS.ServerName,
 					}

@@ -21,6 +21,7 @@ package server_handler
 
 import (
 	"context"
+	"net/netip"
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/mlog"
@@ -60,6 +61,10 @@ type EntryHandlerOpts struct {
 	// QueryTimeout limits the timeout value of each query.
 	// Default is defaultQueryTimeout.
 	QueryTimeout time.Duration
+
+	// TrustedECS identifies transport peers allowed to supply a full client
+	// address through ECS. An empty list disables identity restoration.
+	TrustedECS []netip.Prefix
 }
 
 func (opts *EntryHandlerOpts) init() {
@@ -77,6 +82,7 @@ var _ server.Handler = (*EntryHandler)(nil)
 
 func NewEntryHandler(opts EntryHandlerOpts) *EntryHandler {
 	opts.init()
+	opts.TrustedECS = append([]netip.Prefix(nil), opts.TrustedECS...)
 	return &EntryHandler{opts: opts}
 }
 
@@ -95,6 +101,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 
 	qCtx := query_context.NewContext(q)
 	qCtx.ServerMeta = serverMeta
+	h.restoreClientIdentity(qCtx)
 
 	// exec entry
 	err := h.opts.Entry.Exec(ctx, qCtx)

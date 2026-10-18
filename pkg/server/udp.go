@@ -71,8 +71,8 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 			continue
 		}
 
-		q := new(dns.Msg)
-		if err := q.Unpack((*rb)[:n]); err != nil {
+		q, err := unpackQuery((*rb)[:n])
+		if err != nil {
 			logger.Warn("invalid msg", zap.Error(err), zap.Binary("msg", (*rb)[:n]), zap.Stringer("from", remoteAddr))
 			continue
 		}
@@ -88,7 +88,7 @@ func ServeUDP(c *net.UDPConn, h Handler, opts UDPServerOpts) error {
 
 		// handle query
 		go func() {
-			payload := h.Handle(listenerCtx, q, QueryMeta{ClientAddr: remoteAddr.Addr(), FromUDP: true}, pool.PackBuffer)
+			payload := h.Handle(listenerCtx, q, QueryMeta{PeerAddr: remoteAddr.Addr(), ClientAddr: remoteAddr.Addr(), FromUDP: true}, pool.PackBuffer)
 			if payload == nil {
 				return
 			}
