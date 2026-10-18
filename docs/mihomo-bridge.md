@@ -1,6 +1,6 @@
 # MosDNS 与 Mihomo 域名映射桥接
 
-此分支让 MosDNS 记录实际返回的 DNS 地址，让 Mihomo 查询域名用于真实 IP 连接的分流。DNS 链路保持 `LAN → dnsmasq → MosDNS → 原有上游`；业务连接仍拨号到原始目标 IP。
+此分支让 MosDNS 记录发送前最终 DNS 应答中的地址，让 Mihomo 查询域名用于真实 IP 连接的分流。DNS 链路保持 `LAN → dnsmasq → MosDNS → 原有上游`；业务连接仍拨号到原始目标 IP。
 
 开发基线：MosDNS `9cfb7ce985599c087cb7ccfb1531d0c0f4021242`；Mihomo `v1.19.32`（`88dcbf7f1614a67c3b36b848ee3592dfa92ada36`，官方 `Meta` 内核分支）。长期维护分支为 [MosDNS fork 的 main](https://github.com/LianZiZhou/mosdns/tree/main) 和 [Mihomo fork 的 Meta](https://github.com/LianZiZhou/mihomo/tree/Meta)，后者也是 Mihomo fork 的默认分支。
 
@@ -34,7 +34,11 @@ domain-mapping:
 trusted_ecs: ["127.0.0.1/32", "::1/128"]
 ```
 
-默认空列表，不从 ECS 恢复身份。信任判断只使用真实传输对端 `PeerAddr`；HTTP 的 `src_ip_header` 无法扩大信任范围。仅当真实对端命中 CIDR，且请求具有唯一、合法的 IPv4 `/32` 或 IPv6 `/128` ECS、scope 为零时，入口才覆盖 `ServerMeta.ClientAddr`。错误 CIDR 在启动时报错。
+默认空列表，不从 ECS 恢复身份。ECS 信任判断只使用真实传输对端 `PeerAddr`。仅当真实对端命中 CIDR，且请求具有唯一、合法的 IPv4 `/32` 或 IPv6 `/128` ECS、scope 为零时，入口才覆盖 `ServerMeta.ClientAddr`。错误 CIDR 在启动时报错。
+
+CIDR 匹配忽略 IPv6 地址的接口 zone，原始 `PeerAddr` 仍保留 `%eth0` 等信息。例如 `fe80::/64` 同时信任该地址范围内经 `eth0`、`eth1` 等接口连接的对端；CIDR 本身不约束接口。需要限制入口接口时，应通过监听配置和防火墙实现。默认 loopback 配置不受此影响。
+
+HTTP 的 `src_ip_header` 无法改变 ECS 信任判断，但该选项原有的行为会直接将头部地址作为 `ClientAddr`。若开启此选项并允许终端直达 HTTP 入口，终端仍能伪造头部身份，影响 `client_ip` 策略及映射归属；配置 `trusted_ecs` 不会阻止这条独立路径。此类入口应仅允许可信反向代理访问，并由代理覆盖客户端地址头。普通 HTTP 代理也不会自动清理用户提供的 ECS，只有能可靠生成或覆盖 ECS 的转发器才适合加入 `trusted_ecs`。
 
 恢复发生于所有插件之前，因此 `client_ip`、限速、查询日志、fallback 和 lazy cache 的上下文副本使用同一个客户端地址。`PeerAddr` 保留传输来源，`ClientAddrFromECS` 标记身份来源；日志可检查 `client`、`peer`、`client_source`。
 
@@ -52,15 +56,21 @@ MosDNS 默认把原 OPT 留在 `ClientOpt`，上游查询从干净 OPT 开始，
     → client_ip 选择解析策略
       → 该策略独立 cache
         → 原有 forward / fallback
-    ← 最终实际选择的应答
-  ← 登记该客户端映射，再返回应答
+    ← 策略最终选择的应答
+  ← 可选地址筛选及临时预留
+入口处理 UDP 大小限制（TCP 无此截断），再编码最终应答
+  → 成功应答完成编码且非 TC：登记映射，将预留转为 TTL 租约
+  → 编码失败、错误应答或 TC：释放预留，不登记该应答
+传输层发送已编码应答
 ```
 
 不同解析策略使用独立 cache 实例及独立 dump 文件；同一策略的客户端可共用 cache。隔离边界是整个解析策略，包括可能改变应答的公网 ECS。不要在客户端分支之前放共享解析缓存，也不要让不同策略引用同一 cache tag。
 
 从共享缓存迁移时，采用新的独立 dump 路径并冷启动，不把旧共享 dump 复制给各策略。策略变更后清理受影响实例的缓存与旧 dump。现有 `/plugins/<cache-tag>/flush`、`/dump`、`/load_dump` 仍按实例工作。
 
-`domain_mapping` 必须包在所有缓存、fallback 和应答变换外层。普通命中与 lazy 命中都会登记本次客户端实际拿到的应答；后台刷新和竞争失败的备用应答不会经过该外层，不会提前写入索引。lazy 应答按实际返回的短 TTL 登记。
+`domain_mapping` 必须包在所有缓存、fallback 和应答变换外层。它在链路返回后准备观察，并等待入口完成 UDP 截断及最终编码后再登记。普通命中与 lazy 命中均按最终应答记录，lazy 应答采用返回的短 TTL；后台刷新和竞争失败的备用应答不会提前写入索引。
+
+最终 `TC=true` 的截断应答整包不作为证据，后续 TCP 重试成功后才登记完整应答。编码失败或最终错误应答也不登记，并释放本次临时预留。登记发生在传输层写入之前，避免客户端收到 DNS 应答后立即建立业务连接时映射尚未就绪；这不能证明终端已经收到。后续 socket 写入失败时不会回滚已登记的映射与 TTL 租约。
 
 dnsmasq 的动态 ECS 缓存行为依赖版本。目标是每个客户端的上游 DNS 请求都抵达 MosDNS，不能被共享缓存提前回答。已用 dnsmasq 2.92（Ubuntu 包 `2.92-1ubuntu0.5`）实测动态 `/32,/128` 模式和非零缓存。更旧版本应按实际包复测；不要直接套用“关闭缓存”到使用 `--dnssec` 的实例。dnsmasq 自己生成的 hosts/DHCP/local 应答不会经过 MosDNS，当前不纳入桥接索引。
 
@@ -85,6 +95,8 @@ GET /plugins/domain_index/v1/stats
 
 `ip` 必填，`client` 可选，均为 IP 字面量。非法或重复参数返回 HTTP 400；有效查询返回 HTTP 200 与 `status: hit|miss`。客户端索引优先，未命中查全局；多个域名共享地址时选择最近观察的域名，并返回冲突信息。时间使用 RFC3339Nano。
 
+`candidates` 是按最近观察顺序排列、按域名去重的诊断列表，最多返回 **32 个域名**，不表示索引中的全部记录。顶层 `domain` 等字段仍对应最近的候选；所用客户端或全局索引范围内存在两个或以上有效域名时，`conflict` 保持为 `true`。此上限不会淘汰观察记录或改变 TTL、客户端优先级及选中域名，避免大量共享 IP 候选使 HTTP 响应超过 Mihomo 的读取上限。
+
 ```json
 {
   "version": 1,
@@ -105,7 +117,11 @@ GET /plugins/domain_index/v1/stats
 }
 ```
 
-`source` 为 `a`、`aaaa`、`https_hint` 或 `svcb_hint`。只沿原问题可达的 CNAME/HTTPS/SVCB AliasMode 关联证据，采用地址与关联链的最短 TTL；无关 additional 记录不作为证据。HTTPS/SVCB hints 单独标识，原 ECH 参数保持原样。重复观察不能提前撤销同一客户端先前仍有效的应答。
+`source` 为 `a`、`aaaa`、`https_hint` 或 `svcb_hint`。普通 A/AAAA 查询只沿 Answer 中从原问题可达的 CNAME 链记录地址。HTTPS/SVCB 查询还会检查相关 Additional：沿 CNAME 和同类型 AliasMode 查找服务记录，再按 ServiceMode 的目标名称查找 A/AAAA；目标为 `.` 时使用服务记录自身名称，地址查找可继续沿 CNAME。HTTPS 与 SVCB 类型不互相串接，无关 Additional 不作为证据。
+
+AliasMode 最终目标的 A/AAAA 也可作为客户端回退端点证据；中间别名的地址不采用。同一 RRset 存在 AliasMode 时忽略其中的 ServiceMode 目标和 hints。
+
+地址与 hints 均采用自身和关联链的最短 TTL；HTTPS/SVCB hints 单独标识来源，原 ECH 参数保持原样。重复观察不能提前撤销同一客户端先前仍有效的应答。
 
 miss 缺省命中字段，返回 `candidates: []`、`conflict: false`。Mihomo 要求命中带有尚未过期的 `expires_at`；不缓存已完成的查询，仅合并同时在途的相同客户端＋目标查询。
 
@@ -115,13 +131,17 @@ miss 缺省命中字段，返回 `candidates: []`、`conflict: false`。Mihomo �
 
 `allocation.enable` 默认关闭。开启后，仅从普通且可安全筛选的 A/AAAA 应答中，按地址族选取一个**该域名本次上游实际返回的地址**；不虚构地址，不借用其他域名的地址。优先延用仍在候选池且仅由本域名持有的地址，否则选择全局未占用地址。复制应答后筛选，缓存保留完整候选。
 
-所有已返回地址，包括耗尽回退、未筛选应答和 hints，均占用租约直至有效期结束。活动租约不因容量压力提前淘汰；容量不足时保守暂停筛选，直至无法记录的应答全部过期。`allocation.size` 默认继承 `size`。
+筛选阶段临时预留所有计划发送的关联地址，包括耗尽回退、未筛选应答和 hints，防止并发查询重复分配。最终应答成功编码且非 TC 时，按编码后仍存在的证据建立 TTL 租约并释放预留；失败或 TC 则只释放预留。
+
+活动 TTL 租约不因容量压力提前淘汰；容量不足时保守暂停筛选，直至无法记录的成功应答全部过期。临时预留表达到容量上限时，也会在相关请求完成前暂停筛选；请求完成后，根据实际编码结果决定是否需要继续按 TTL 降级。`allocation.size` 默认继承 `size`。
 
 带 CNAME、DNSSEC DO/AD/CD/RRSIG、HTTPS/SVCB 或已知仍有效的 HTTPS/SVCB 关联时跳过筛选。候选耗尽、容量不足或不安全时保留原应答并增加诊断计数。重复地址取最短 TTL。分配只能降低冲突概率；重启丢失租约、客户端超 TTL 使用旧地址、后续 HTTPS 应答及新候选重叠，均不能保证绝对唯一。
 
 ## 验证与限制
 
 两仓库分别运行 `go test ./...`。新增测试覆盖可信 ECS 的 UDP/TCP/DoT/DoQ 实际入口、HTTP 头部边界、非法 ECS、旧 `client_ip` 策略、独立缓存及 dump/lazy 刷新、映射 TTL/冲突/缓存命中、分配并发/容量/安全跳过，以及 Mihomo 契约、超时、并发、热重载、TCP/UDP 入口与拨号地址保持。
+
+审计回归额外覆盖最终 UDP 截断、编码失败及预留释放，HTTPS/SVCB 相关 Additional 的目标、类型和 TTL 边界，4000 个长域名候选及 65536 条观察记录，带 zone 的 IPv6 可信对端，以及 provider 迟到、旧请求退出与新请求共享的超时边界。
 
 跨进程脚本只依赖 Python 标准库与编译后的二进制，不使用公网 DNS，不需要透明代理或 root：
 
@@ -134,7 +154,7 @@ python3 scripts/domain_bridge_smoke.py \
   --work-dir /absolute/path/test-results
 ```
 
-省略 `--dnsmasq` 时直接注入可信 ECS，可用于 Windows。脚本启动独立上游与回显服务，关闭 Mihomo DNS/嗅探，以数字目的地址经 SOCKS 检验规则命中；同时检查客户端上游隔离、缓存命中观察、内部 ECS 不外发、跨地址族回退、热重载与 provider 停机后的 HTTP 嗅探回退。每个 UDP 会话使用新源端口并核对后续包。结果和进程日志保留在指定目录。
+省略 `--dnsmasq` 时直接注入可信 ECS，可用于 Windows。脚本启动独立上游与回显服务，关闭 Mihomo DNS/嗅探，以数字目的地址经 SOCKS 检验规则命中；同时检查客户端上游隔离、缓存命中观察、内部 ECS 不外发、跨地址族回退、热重载与 provider 停机后的 HTTP 嗅探回退。额外直接查询 MosDNS，确认截断应答不会覆盖旧映射、HTTPS 仅登记相关 Additional。每个 UDP 会话使用新源端口并核对后续包。结果和进程日志保留在指定目录。
 
 真实 dnsmasq 2.92 Linux 联调中，1000/1000 条 TCP 连接与 100/100 个 UDP 会话通过。这证明可重复的本地链路，不代表已复现原现场约 4% 的失败，也不等同于 OpenWRT Netfilter/TProxy 实机验收。当前缺少 CGO 编译器，未运行 Go race detector。
 

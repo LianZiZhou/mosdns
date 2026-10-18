@@ -28,6 +28,14 @@ func testPlugin(t *testing.T, args Args) (*DomainMapping, *time.Time) {
 	return p, &now
 }
 
+// record models an immediately finalized response for package-level tests.
+// Production execution always waits for EntryHandler's final encoding hook.
+func (p *DomainMapping) record(qCtx *query_context.Context) {
+	if finalize := p.prepare(qCtx); finalize != nil {
+		finalize(qCtx.R())
+	}
+}
+
 func testContext(t *testing.T, name, client string, typ uint16, records ...string) *query_context.Context {
 	t.Helper()
 	q := new(dns.Msg)
@@ -216,6 +224,7 @@ func TestOuterCacheRecordsEveryClientAndKeepsFullCandidates(t *testing.T) {
 		if err := walker.ExecNext(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
+		q.FinalizeResponse(q.R())
 		if len(q.R().Answer) != 1 {
 			t.Fatal("allocation did not filter client response")
 		}
@@ -253,6 +262,7 @@ func TestLazyCacheRecordsOnlyReturnedAnswer(t *testing.T) {
 		if err := walker.ExecNext(context.Background(), q); err != nil {
 			t.Fatal(err)
 		}
+		q.FinalizeResponse(q.R())
 	}
 	run("192.168.1.1")
 	time.Sleep(1100 * time.Millisecond)

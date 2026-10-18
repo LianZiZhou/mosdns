@@ -53,6 +53,56 @@ type observationIndex struct {
 	order    list.List
 }
 
+// Candidates are bounded diagnostics, not an exhaustive list of observations.
+// Keep at least two so limiting the list never hides a domain conflict.
+const maxLookupCandidates = 32
+
+// candidateHeap retains the newest observation for each of the newest domains.
+// Its root is the oldest retained candidate, so lookup work and temporary memory
+// do not include sorting or collecting every domain in a large shared-IP bucket.
+type candidateHeap struct {
+	ordered  []*observation
+	byDomain map[string]int
+}
+
+func (h candidateHeap) Len() int           { return len(h.ordered) }
+func (h candidateHeap) Less(i, j int) bool { return h.ordered[i].sequence < h.ordered[j].sequence }
+func (h candidateHeap) Swap(i, j int) {
+	h.ordered[i], h.ordered[j] = h.ordered[j], h.ordered[i]
+	h.byDomain[h.ordered[i].Domain], h.byDomain[h.ordered[j].Domain] = i, j
+}
+func (h *candidateHeap) Push(v any) {
+	o := v.(*observation)
+	h.byDomain[o.Domain] = len(h.ordered)
+	h.ordered = append(h.ordered, o)
+}
+func (h *candidateHeap) Pop() any {
+	last := len(h.ordered) - 1
+	o := h.ordered[last]
+	h.ordered[last] = nil
+	h.ordered = h.ordered[:last]
+	delete(h.byDomain, o.Domain)
+	return o
+}
+
+func (h *candidateHeap) consider(o *observation) {
+	if pos, exists := h.byDomain[o.Domain]; exists {
+		if o.sequence > h.ordered[pos].sequence {
+			h.ordered[pos] = o
+			heap.Fix(h, pos)
+		}
+		return
+	}
+	if h.Len() < maxLookupCandidates {
+		heap.Push(h, o)
+	} else if o.sequence > h.ordered[0].sequence {
+		delete(h.byDomain, h.ordered[0].Domain)
+		h.ordered[0] = o
+		h.byDomain[o.Domain] = 0
+		heap.Fix(h, 0)
+	}
+}
+
 func (s *observationIndex) init(size int) {
 	s.size = size
 	s.records = make(map[observationKey]*observation)
@@ -110,20 +160,21 @@ func (s *observationIndex) put(client, ip netip.Addr, candidate Candidate) uint6
 }
 
 func (s *observationIndex) candidates(key lookupKey) []Candidate {
-	byDomain := make(map[string]*observation)
-	for _, o := range s.buckets[key] {
-		previous := byDomain[o.Domain]
-		if previous == nil || o.sequence > previous.sequence {
-			byDomain[o.Domain] = o
-		}
+	bucket := s.buckets[key]
+	if len(bucket) == 0 {
+		return []Candidate{}
 	}
-	ordered := make([]*observation, 0, len(byDomain))
-	for _, o := range byDomain {
-		ordered = append(ordered, o)
+	capacity := min(maxLookupCandidates, len(bucket))
+	top := candidateHeap{
+		ordered:  make([]*observation, 0, capacity),
+		byDomain: make(map[string]int, capacity),
 	}
-	sort.Slice(ordered, func(i, j int) bool { return ordered[i].sequence > ordered[j].sequence })
-	result := make([]Candidate, 0, len(ordered))
-	for _, o := range ordered {
+	for _, o := range bucket {
+		top.consider(o)
+	}
+	sort.Slice(top.ordered, func(i, j int) bool { return top.ordered[i].sequence > top.ordered[j].sequence })
+	result := make([]Candidate, 0, len(top.ordered))
+	for _, o := range top.ordered {
 		result = append(result, o.Candidate)
 	}
 	return result

@@ -14,7 +14,9 @@ func (h *EntryHandler) restoreClientIdentity(qCtx *query_context.Context) {
 	if len(h.opts.TrustedECS) == 0 {
 		return
 	}
-	peer := qCtx.ServerMeta.PeerAddr.Unmap()
+	// CIDRs describe address ranges, not interfaces. Ignore the interface zone
+	// only for matching; retain the original transport peer in ServerMeta.
+	peer := qCtx.ServerMeta.PeerAddr.WithZone("").Unmap()
 	trusted := false
 	for _, prefix := range h.opts.TrustedECS {
 		if prefix.Contains(peer) {

@@ -19,6 +19,12 @@ type lease struct {
 	key       leaseKey
 	expiresAt time.Time
 	heapPos   int
+	pending   int
+}
+
+type reservation struct {
+	keys     []leaseKey
+	overflow bool
 }
 
 type leaseHeap []*lease
@@ -50,6 +56,9 @@ type allocator struct {
 	owners       map[netip.Addr]map[string]*lease
 	expiry       leaseHeap
 	blockedUntil time.Time
+	// Untracked pending responses temporarily block all allocation. Their
+	// actual TTL is committed only if final response encoding succeeds.
+	pendingOverflow int
 }
 
 func (a *allocator) init(size int) {
@@ -61,18 +70,81 @@ func (a *allocator) init(size int) {
 func (a *allocator) expire(now time.Time) {
 	for len(a.expiry) > 0 && !now.Before(a.expiry[0].expiresAt) {
 		l := heap.Pop(&a.expiry).(*lease)
-		delete(a.leases, l.key)
-		delete(a.owners[l.key.ip], l.key.domain)
-		if len(a.owners[l.key.ip]) == 0 {
-			delete(a.owners, l.key.ip)
+		l.expiresAt = time.Time{}
+		if l.pending == 0 {
+			a.remove(l)
 		}
+	}
+}
+
+func (a *allocator) remove(l *lease) {
+	delete(a.leases, l.key)
+	delete(a.owners[l.key.ip], l.key.domain)
+	if len(a.owners[l.key.ip]) == 0 {
+		delete(a.owners, l.key.ip)
+	}
+}
+
+func (a *allocator) add(key leaseKey) *lease {
+	l := &lease{key: key}
+	a.leases[key] = l
+	if a.owners[key.ip] == nil {
+		a.owners[key.ip] = make(map[string]*lease)
+	}
+	a.owners[key.ip][key.domain] = l
+	return l
+}
+
+func (a *allocator) reserve(domain string, response *dns.Msg) reservation {
+	evidence, serviceTTL := responseEvidence(domain, response)
+	keys := make(map[leaseKey]struct{}, len(evidence)+1)
+	if serviceTTL > 0 {
+		keys[leaseKey{domain: domain}] = struct{}{}
+	}
+	for _, e := range evidence {
+		if e.ttl > 0 {
+			keys[leaseKey{domain: domain, ip: e.ip}] = struct{}{}
+		}
+	}
+	var reserved reservation
+	for key := range keys {
+		l := a.leases[key]
+		if l == nil {
+			if len(a.leases) >= a.size {
+				reserved.overflow = true
+				continue
+			}
+			l = a.add(key)
+		}
+		l.pending++
+		reserved.keys = append(reserved.keys, key)
+	}
+	if reserved.overflow {
+		a.pendingOverflow++
+	}
+	return reserved
+}
+
+func (a *allocator) release(reserved reservation) {
+	for _, key := range reserved.keys {
+		l := a.leases[key]
+		l.pending--
+		if l.pending == 0 && l.expiresAt.IsZero() {
+			a.remove(l)
+		}
+	}
+	if reserved.overflow {
+		a.pendingOverflow--
 	}
 }
 
 func (p *DomainMapping) rememberLease(key leaseKey, expires time.Time) {
 	a := &p.alloc
 	if existing := a.leases[key]; existing != nil {
-		if existing.expiresAt.Before(expires) {
+		if existing.expiresAt.IsZero() {
+			existing.expiresAt = expires
+			heap.Push(&a.expiry, existing)
+		} else if existing.expiresAt.Before(expires) {
 			existing.expiresAt = expires
 			heap.Fix(&a.expiry, existing.heapPos)
 		}
@@ -88,12 +160,8 @@ func (p *DomainMapping) rememberLease(key leaseKey, expires time.Time) {
 		p.stats.Capacity++
 		return
 	}
-	l := &lease{key: key, expiresAt: expires}
-	a.leases[key] = l
-	if a.owners[key.ip] == nil {
-		a.owners[key.ip] = make(map[string]*lease)
-	}
-	a.owners[key.ip][key.domain] = l
+	l := a.add(key)
+	l.expiresAt = expires
 	heap.Push(&a.expiry, l)
 }
 
@@ -103,7 +171,7 @@ func (p *DomainMapping) allocate(qCtx *query_context.Context, domain string, now
 		p.stats.Unsafe++
 		return nil
 	}
-	if now.Before(p.alloc.blockedUntil) {
+	if now.Before(p.alloc.blockedUntil) || p.alloc.pendingOverflow > 0 {
 		p.stats.Capacity++
 		return nil
 	}
@@ -181,7 +249,6 @@ func (p *DomainMapping) allocate(qCtx *query_context.Context, domain string, now
 			selected[addr] = false
 		}
 	}
-	p.stats.Allocated++
 	return copy
 }
 

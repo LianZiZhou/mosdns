@@ -86,7 +86,7 @@ def records(data):
     return result
 
 
-def dns_query(port, name, client="127.0.0.2", ecs=None, tcp=False):
+def dns_query(port, name, client="127.0.0.2", ecs=None, tcp=False, qtype=1, raw=False):
     request_id = int.from_bytes(os.urandom(2), "big")
     extra = b""
     if ecs is not None:
@@ -94,7 +94,7 @@ def dns_query(port, name, client="127.0.0.2", ecs=None, tcp=False):
         subnet = struct.pack("!HBB", 1 if address.version == 4 else 2, address.max_prefixlen, 0) + address.packed
         option = struct.pack("!HH", 8, len(subnet)) + subnet
         extra = b"\x00" + struct.pack("!HHIH", 41, 1232, 0, len(option)) + option
-    request = struct.pack("!6H", request_id, 0x100, 1, 0, 0, bool(extra)) + dns_name(name) + struct.pack("!HH", 1, 1) + extra
+    request = struct.pack("!6H", request_id, 0x100, 1, 0, 0, bool(extra)) + dns_name(name) + struct.pack("!HH", qtype, 1) + extra
     with socket.socket(type=socket.SOCK_STREAM if tcp else socket.SOCK_DGRAM) as sock:
         sock.settimeout(4)
         sock.bind((client, 0))
@@ -106,6 +106,8 @@ def dns_query(port, name, client="127.0.0.2", ecs=None, tcp=False):
             sock.sendto(request, ("127.0.0.1", port))
             response, _ = sock.recvfrom(65535)
     assert response[:2] == request[:2]
+    if raw:
+        return response
     return [str(ipaddress.ip_address(rr[4])) for rr in records(response) if rr[1] == 1]
 
 
@@ -134,13 +136,28 @@ class DNSHandler(socketserver.BaseRequestHandler):
                         option, length = struct.unpack_from("!HH", payload, pos)
                         self.server.ecs_seen += option == 8
                         pos += 4 + length
-        if qtype != 1:
+        additional, additional_count, answer_count = b"", 0, 0
+        if name == "https.bridge.test" and qtype == 65:
+            target = "svc-endpoint.bridge.test"
+            binding = struct.pack("!H", 1) + dns_name(target)
+            answer = b"\xc0\x0c" + struct.pack("!HHIH", 65, 1, 600, len(binding)) + binding
+            answer_count = 1
+            for owner, address in ((target, "203.0.113.111"), ("unrelated.bridge.test", "203.0.113.112")):
+                additional += dns_name(owner) + struct.pack("!HHIH", 1, 1, 600, 4) + socket.inet_aton(address)
+                additional_count += 1
+        elif name == "truncated.bridge.test" and qtype == 1:
+            answer = b"".join(b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, 600, 4) + socket.inet_aton(f"203.0.113.{i}") for i in range(1, 101))
+            answer_count = 100
+        elif qtype != 1:
             answer = b""
         else:
             address = self.server.policy_address if name == "policy.bridge.test" else "127.0.0.1"
+            if name == "previous.bridge.test":
+                address = "203.0.113.100"
             ttl = 1 if name == "expiry.bridge.test" else 600
             answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, ttl, 4) + socket.inet_aton(address)
-        response = data[:2] + struct.pack("!5H", 0x8180, 1, bool(answer), 0, 0) + data[12:end + 4] + answer
+            answer_count = 1
+        response = data[:2] + struct.pack("!5H", 0x8180, 1, answer_count, 0, additional_count) + data[12:end + 4] + answer + additional
         sock.sendto(response, self.client_address)
 
 
@@ -354,6 +371,19 @@ def main():
         assert upstreams[1].calls.get("cached.bridge.test") == 1
         assert not any(server.ecs_seen for server in upstreams), "internal identity ECS leaked upstream"
         print("PASS ECS identity, upstream policy isolation, cache-hit observation, TCP DNS", flush=True)
+
+        # Exercise the actual server's final packing and Additional processing.
+        # Use MosDNS directly so dnsmasq's automatic TCP retry cannot hide TC.
+        dns_query(mos_port, "previous.bridge.test", "127.0.0.1", "127.0.0.2")
+        truncated = dns_query(mos_port, "truncated.bridge.test", "127.0.0.1", "127.0.0.2", raw=True)
+        assert struct.unpack_from("!H", truncated, 2)[0] & 0x200
+        assert socket.inet_aton("203.0.113.100") not in [rr[4] for rr in records(truncated) if rr[1] == 1]
+        assert get_json(api + "?ip=203.0.113.100&client=127.0.0.2")["domain"] == "previous.bridge.test"
+        dns_query(mos_port, "https.bridge.test", "127.0.0.1", "127.0.0.2", qtype=65)
+        assert get_json(api + "?ip=203.0.113.111&client=127.0.0.2")["domain"] == "https.bridge.test"
+        assert get_json(api + "?ip=203.0.113.112&client=127.0.0.2")["status"] == "miss"
+        result["response_boundary_regressions"] = "pass"
+        print("PASS UDP truncation preserves prior evidence and only related HTTPS Additional is indexed", flush=True)
 
         query("alpha.bridge.test", "127.0.0.2")
         query("beta.bridge.test", "127.0.0.3")

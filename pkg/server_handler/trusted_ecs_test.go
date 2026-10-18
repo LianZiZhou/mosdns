@@ -141,6 +141,39 @@ func TestNonINETQueryDoesNotRestoreECS(t *testing.T) {
 	h.Handle(context.Background(), q, server.QueryMeta{PeerAddr: netip.MustParseAddr("127.0.0.1")}, pack)
 }
 
+func TestTrustedECSCIDRMatchesAcrossIPv6Zones(t *testing.T) {
+	for _, tt := range []struct {
+		peer string
+		want bool
+	}{
+		{"fe80::1", true},
+		{"fe80::1%eth0", true},
+		{"fe80::1%eth1", true},
+		{"fe81::1%eth0", false},
+		{"fd00::1%eth0", false},
+	} {
+		t.Run(tt.peer, func(t *testing.T) {
+			peer := netip.MustParseAddr(tt.peer)
+			var got server.QueryMeta
+			h := server_handler.NewEntryHandler(server_handler.EntryHandlerOpts{
+				TrustedECS: []netip.Prefix{netip.MustParsePrefix("fe80::/64")},
+				Entry: sequence.ExecutableFunc(func(_ context.Context, qc *query_context.Context) error {
+					got = qc.ServerMeta
+					return nil
+				}),
+			})
+			h.Handle(context.Background(), query(ecs("192.168.1.10", 32)), server.QueryMeta{PeerAddr: peer, ClientAddr: peer}, pack)
+			want := peer
+			if tt.want {
+				want = netip.MustParseAddr("192.168.1.10")
+			}
+			if got.PeerAddr != peer || got.ClientAddr != want || got.ClientAddrFromECS != tt.want {
+				t.Fatalf("zone matching changed identity or transport peer: %+v", got)
+			}
+		})
+	}
+}
+
 func TestTrustedECSClientIPRuleMatchesSameUpstream(t *testing.T) {
 	plugins := map[string]any{}
 	m := coremain.NewTestMosdnsWithPlugins(plugins)

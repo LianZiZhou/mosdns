@@ -49,6 +49,11 @@ type Context struct {
 	respOpt     *dns.OPT // nil if clientOpt == nil
 	upstreamOpt *dns.OPT // may be nil
 
+	// Response finalizers belong to the transport request, not to copied
+	// fallback/lazy-cache contexts. They run once after response encoding.
+	responseFinalizers []func(*dns.Msg)
+	responseFinalized  bool
+
 	// lazy init.
 	kv    map[uint32]any
 	marks map[uint32]struct{}
@@ -156,6 +161,31 @@ func (ctx *Context) UpstreamOpt() *dns.OPT {
 	return ctx.upstreamOpt
 }
 
+// OnResponseFinalized registers a callback for the final, successfully encoded
+// response. A nil response means no usable response was encoded. The callback
+// runs before the transport writes the payload; successful delivery is unknown.
+func (ctx *Context) OnResponseFinalized(callback func(*dns.Msg)) {
+	if ctx.responseFinalized {
+		callback(nil)
+		return
+	}
+	ctx.responseFinalizers = append(ctx.responseFinalizers, callback)
+}
+
+// FinalizeResponse executes response callbacks at most once. Callers should
+// defer FinalizeResponse(nil) to release pending state on all failure paths.
+func (ctx *Context) FinalizeResponse(response *dns.Msg) {
+	if ctx.responseFinalized {
+		return
+	}
+	ctx.responseFinalized = true
+	callbacks := ctx.responseFinalizers
+	ctx.responseFinalizers = nil
+	for _, callback := range callbacks {
+		callback(response)
+	}
+}
+
 // InfoField returns a zap.Field contains a brief summary of this Context.
 // Useful in log.
 func (ctx *Context) InfoField() zap.Field {
@@ -172,6 +202,8 @@ func (ctx *Context) Copy() *Context {
 
 // CopyTo deep copies this Context to d.
 // Note that values that stored by StoreValue is not deep-copied.
+// Transport response finalizers are not copied. Existing finalizers on d are
+// preserved, so selecting a fallback context cannot discard pending cleanup.
 func (ctx *Context) CopyTo(d *Context) *Context {
 	d.id = ctx.id
 	d.startTime = ctx.startTime

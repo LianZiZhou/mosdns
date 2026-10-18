@@ -100,6 +100,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 	defer cancel()
 
 	qCtx := query_context.NewContext(q)
+	defer qCtx.FinalizeResponse(nil)
 	qCtx.ServerMeta = serverMeta
 	h.restoreClientIdentity(qCtx)
 
@@ -138,6 +139,7 @@ func (h *EntryHandler) Handle(ctx context.Context, q *dns.Msg, serverMeta server
 		h.opts.Logger.Error("internal err: failed to pack resp msg", qCtx.InfoField(), zap.Error(err))
 		return nil
 	}
+	qCtx.FinalizeResponse(resp)
 	return payload
 }
 

@@ -1,4 +1,4 @@
-// Package domain_mapping records the DNS answers actually returned to clients.
+// Package domain_mapping records successfully encoded DNS answers.
 // Place this recursive plugin outside all caches and fallback branches.
 package domain_mapping
 
@@ -107,23 +107,27 @@ func (p *DomainMapping) Exec(ctx context.Context, qCtx *query_context.Context, n
 	if err := next.ExecNext(ctx, qCtx); err != nil {
 		return err
 	}
-	p.record(qCtx)
+	finalize := p.prepare(qCtx)
+	if finalize != nil {
+		qCtx.OnResponseFinalized(finalize)
+	}
 	return nil
 }
 
-func (p *DomainMapping) record(qCtx *query_context.Context) {
+func (p *DomainMapping) prepare(qCtx *query_context.Context) func(*dns.Msg) {
 	r := qCtx.R()
 	if r == nil || r.Rcode != dns.RcodeSuccess || r.Truncated {
-		return
+		return nil
 	}
 	domain := canonicalName(qCtx.QQuestion().Name)
 	if domain == "" {
-		return
+		return nil
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.now()
-	p.index.expire(now)
+	var reserved reservation
+	allocated := false
 	if p.args.Allocation.Enable {
 		p.alloc.expire(now)
 		if replacement := p.allocate(qCtx, domain, now); replacement != nil {
@@ -134,8 +138,36 @@ func (p *DomainMapping) record(qCtx *query_context.Context) {
 			}
 			qCtx.SetResponse(replacement)
 			r = replacement
+			allocated = true
 		}
+		// Reserve every planned address, including unscreened fallback
+		// responses. Concurrent selection must see these until encoding
+		// either commits the final response or releases the reservation.
+		reserved = p.alloc.reserve(domain, r)
 	}
+	client := qCtx.ServerMeta.ClientAddr.Unmap()
+	return func(response *dns.Msg) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.args.Allocation.Enable {
+			p.alloc.release(reserved)
+		}
+		if response == nil || response.Rcode != dns.RcodeSuccess || response.Truncated {
+			return
+		}
+		// A truncated reply is deliberately not evidence. A subsequent TCP
+		// retry will register its complete, successfully encoded response.
+		if allocated {
+			p.stats.Allocated++
+		}
+		p.observe(domain, client, response, p.now())
+	}
+}
+
+// observe is called under p.mu only for the final encoded response.
+func (p *DomainMapping) observe(domain string, client netip.Addr, r *dns.Msg, now time.Time) {
+	p.index.expire(now)
+	p.alloc.expire(now)
 	evidence, serviceTTL := responseEvidence(domain, r)
 	if p.args.Allocation.Enable && serviceTTL > 0 {
 		// Any observed HTTPS/SVCB association can bypass A/AAAA selection,
@@ -147,7 +179,7 @@ func (p *DomainMapping) record(qCtx *query_context.Context) {
 			continue
 		}
 		expires := now.Add(time.Duration(e.ttl) * time.Second)
-		p.stats.ObservationEvicts += p.index.put(qCtx.ServerMeta.ClientAddr.Unmap(), e.ip, Candidate{
+		p.stats.ObservationEvicts += p.index.put(client, e.ip, Candidate{
 			Domain: domain, Source: e.source, ObservedAt: now, ExpiresAt: expires,
 		})
 		if p.args.Allocation.Enable {
@@ -187,7 +219,7 @@ func (p *DomainMapping) Snapshot() Stats {
 	p.index.expire(now)
 	p.alloc.expire(now)
 	s := p.stats
-	s.Observations, s.Leases = len(p.index.records), len(p.alloc.leases)
+	s.Observations, s.Leases = len(p.index.records), len(p.alloc.expiry)
 	if now.Before(p.alloc.blockedUntil) {
 		s.BlockedUntil = p.alloc.blockedUntil
 	}

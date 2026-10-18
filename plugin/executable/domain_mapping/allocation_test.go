@@ -149,7 +149,11 @@ func TestBindingsWithoutHintsRevokeAllocationEligibility(t *testing.T) {
 		t.Run(record, func(t *testing.T) {
 			p, now := testPlugin(t, Args{Allocation: AllocationArgs{Enable: true}})
 			p.record(testContext(t, "one.test", "", dns.TypeA, "one.test. 60 IN A 203.0.113.1", "one.test. 60 IN A 203.0.113.2"))
-			binding := testContext(t, "one.test", "", dns.TypeHTTPS, record)
+			bindingRR, err := dns.NewRR(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			binding := testContext(t, "one.test", "", bindingRR.Header().Rrtype, record)
 			before := binding.R().String()
 			p.record(binding)
 			if binding.R().String() != before {
@@ -221,5 +225,83 @@ func TestConcurrentAllocation(t *testing.T) {
 	}
 	if len(seen) != count {
 		t.Fatalf("only %d allocations succeeded", len(seen))
+	}
+}
+
+func TestPendingAllocationsReserveBeforeEncodingAndReleaseOnFailure(t *testing.T) {
+	p, _ := testPlugin(t, Args{Allocation: AllocationArgs{Enable: true}})
+	makeQuery := func(domain string) *query_context.Context {
+		return testContext(t, domain, "192.168.1.1", dns.TypeA,
+			fmt.Sprintf("%s. 60 IN A 203.0.113.1", domain), fmt.Sprintf("%s. 60 IN A 203.0.113.2", domain))
+	}
+	one, two := makeQuery("one.test"), makeQuery("two.test")
+	finishOne, finishTwo := p.prepare(one), p.prepare(two)
+	if ips := answerIPs(one); len(ips) != 1 || ips[0] != "203.0.113.1" {
+		t.Fatalf("first selection: %v", ips)
+	}
+	if ips := answerIPs(two); len(ips) != 1 || ips[0] != "203.0.113.2" {
+		t.Fatalf("concurrent pending reservation was ignored: %v", ips)
+	}
+	if stats := p.Snapshot(); stats.Leases != 0 || stats.Observations != 0 || stats.Allocated != 0 {
+		t.Fatalf("unencoded responses already committed: %+v", stats)
+	}
+	finishOne(nil)
+	three := makeQuery("three.test")
+	finishThree := p.prepare(three)
+	if ips := answerIPs(three); len(ips) != 1 || ips[0] != "203.0.113.1" {
+		t.Fatalf("failed encoding leaked reservation: %v", ips)
+	}
+	finishTwo(two.R())
+	finishThree(three.R())
+	if stats := p.Snapshot(); stats.Leases != 2 || stats.Observations != 2 || stats.Allocated != 2 {
+		t.Fatalf("finalized responses not committed: %+v", stats)
+	}
+	for _, l := range p.alloc.leases {
+		if l.pending != 0 {
+			t.Fatal("pending reference leaked after finalization")
+		}
+	}
+}
+
+func TestPendingOverflowBlocksSelectionUntilActualResponse(t *testing.T) {
+	p, now := testPlugin(t, Args{Allocation: AllocationArgs{Enable: true, Size: 1}})
+	one := testContext(t, "one.test", "", dns.TypeA, "one.test. 60 IN A 203.0.113.1")
+	finishOne := p.prepare(one)
+	// This unsafe response must retain both actual addresses, but there is no
+	// room to track either while the first response is pending.
+	overflow := testContext(t, "overflow.test", "", dns.TypeA,
+		"overflow.test. 30 IN CNAME endpoint.test.", "endpoint.test. 30 IN A 203.0.113.2", "endpoint.test. 30 IN A 203.0.113.3")
+	finishOverflow := p.prepare(overflow)
+	finishOne(nil)
+	if len(p.alloc.leases) != 0 || p.alloc.pendingOverflow != 1 || !p.alloc.blockedUntil.IsZero() {
+		t.Fatal("overflow prematurely committed or pending references leaked")
+	}
+	three := testContext(t, "three.test", "", dns.TypeA, "three.test. 60 IN A 203.0.113.2", "three.test. 60 IN A 203.0.113.3")
+	finishThree := p.prepare(three)
+	if len(three.R().Answer) != 2 {
+		t.Fatal("allocation ignored untracked pending addresses")
+	}
+	finishThree(nil)
+	finishOverflow(overflow.R())
+	if p.alloc.pendingOverflow != 0 || len(p.alloc.leases) != 1 || !p.alloc.blockedUntil.Equal(now.Add(30*time.Second)) {
+		t.Fatal("actual overflow response was not conservatively committed")
+	}
+}
+
+func TestExpiredCommittedLeaseRetainsPendingReservation(t *testing.T) {
+	p, now := testPlugin(t, Args{Allocation: AllocationArgs{Enable: true}})
+	p.record(testContext(t, "one.test", "", dns.TypeA, "one.test. 1 IN A 203.0.113.1"))
+	one := testContext(t, "one.test", "", dns.TypeA, "one.test. 60 IN A 203.0.113.1")
+	finishOne := p.prepare(one)
+	*now = now.Add(2 * time.Second)
+	two := testContext(t, "two.test", "", dns.TypeA, "two.test. 60 IN A 203.0.113.1", "two.test. 60 IN A 203.0.113.2")
+	finishTwo := p.prepare(two)
+	if ips := answerIPs(two); len(ips) != 1 || ips[0] != "203.0.113.2" {
+		t.Fatalf("expiry removed an active pending reservation: %v", ips)
+	}
+	finishOne(one.R())
+	finishTwo(nil)
+	if l := p.alloc.leases[leaseKey{domain: "one.test", ip: netip.MustParseAddr("203.0.113.1")}]; l == nil || l.pending != 0 || !l.expiresAt.Equal(now.Add(60*time.Second)) {
+		t.Fatalf("pending lease was not promoted after old expiry: %+v", l)
 	}
 }
