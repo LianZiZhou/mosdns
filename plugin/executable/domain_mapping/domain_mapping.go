@@ -37,8 +37,13 @@ type APIArgs struct {
 }
 
 type AllocationArgs struct {
-	Enable bool `yaml:"enable"`
-	Size   int  `yaml:"size"`
+	Enable       bool       `yaml:"enable"`
+	Size         int        `yaml:"size"`
+	ClientScope  bool       `yaml:"client_scope"`
+	StateFile    string     `yaml:"state_file"`
+	ImportFile   string     `yaml:"import_file"`
+	Policy       PolicyArgs `yaml:"policy"`
+	StartupGuard int        `yaml:"startup_guard"` // seconds; zero uses one day
 }
 
 type Candidate struct {
@@ -84,6 +89,12 @@ type Stats struct {
 	RetentionMode       string    `json:"retention_mode,omitempty"`
 	RetentionRenewals   uint64    `json:"retention_renewals,omitempty"`
 	RetentionTouches    uint64    `json:"retention_touches,omitempty"`
+	ClientScoped        bool      `json:"allocation_client_scoped,omitempty"`
+	HistoryComplete     bool      `json:"history_complete"`
+	StateHealthy        bool      `json:"state_healthy"`
+	Generation          uint64    `json:"generation,omitempty"`
+	PolicyCacheEntries  int       `json:"policy_cache_entries,omitempty"`
+	StartupGuardUntil   time.Time `json:"startup_guard_until,omitempty"`
 }
 
 type DomainMapping struct {
@@ -97,6 +108,10 @@ type DomainMapping struct {
 	apiActive   atomic.Int64
 	apiRejected atomic.Uint64
 	apiTimeouts atomic.Uint64
+	clients     *clientAllocator
+	policy      *policyCache
+	state       *stateStore
+	generation  uint64
 }
 
 var _ sequence.RecursiveExecutable = (*DomainMapping)(nil)
@@ -118,8 +133,14 @@ func New(args Args) (*DomainMapping, error) {
 	if err := args.Retention.normalize(); err != nil {
 		return nil, err
 	}
-	if args.Allocation.Enable && args.Retention.extended() {
+	if args.Allocation.Enable && !args.Allocation.ClientScope && args.Retention.extended() {
 		return nil, fmt.Errorf("domain_mapping allocation requires retention mode ttl")
+	}
+	if err := args.Allocation.normalize(); err != nil {
+		return nil, err
+	}
+	if args.Allocation.ClientScope && args.Retention.Mode != retentionLRU {
+		return nil, fmt.Errorf("client-scoped allocation requires retention mode lru")
 	}
 	if args.Size < 0 || args.Allocation.Size < 0 {
 		return nil, fmt.Errorf("domain_mapping sizes must not be negative")
@@ -151,6 +172,17 @@ func New(args Args) (*DomainMapping, error) {
 		p.stats.RetentionMode = args.Retention.Mode
 		p.stats.ObservationCapacity = args.Size
 	}
+	if args.Allocation.ClientScope {
+		p.clients = newClientAllocator(args.Allocation.Size)
+		p.index.onRemove = p.forgetObservation
+		p.stats.ClientScoped = true
+		var err error
+		p.state, err = p.openState()
+		if err != nil {
+			return nil, err
+		}
+		p.policy = newPolicyCache(args.Allocation.Policy)
+	}
 	return p, nil
 }
 
@@ -166,6 +198,9 @@ func (p *DomainMapping) Exec(ctx context.Context, qCtx *query_context.Context, n
 }
 
 func (p *DomainMapping) prepare(qCtx *query_context.Context) func(*dns.Msg) {
+	if p.clients != nil {
+		return p.prepareClient(qCtx)
+	}
 	r := qCtx.R()
 	if r == nil || r.Rcode != dns.RcodeSuccess || r.Truncated {
 		return nil
@@ -222,7 +257,7 @@ func (p *DomainMapping) observe(domain string, client netip.Addr, r *dns.Msg, no
 	p.index.expireBatch(now, observationExpiryBatch)
 	p.alloc.expire(now)
 	evidence, serviceTTL := responseEvidence(domain, r)
-	if p.args.Allocation.Enable && serviceTTL > 0 {
+	if p.args.Allocation.Enable && p.clients == nil && serviceTTL > 0 {
 		// Any observed HTTPS/SVCB association can bypass A/AAAA selection,
 		// including AliasMode or ServiceMode without explicit address hints.
 		p.rememberLease(leaseKey{domain: domain}, now.Add(time.Duration(serviceTTL)*time.Second))
@@ -240,7 +275,7 @@ func (p *DomainMapping) observe(domain string, client netip.Addr, r *dns.Msg, no
 			candidate.RetentionMode = p.args.Retention.Mode
 		}
 		p.stats.ObservationEvicts += p.index.put(client, e.ip, candidate)
-		if p.args.Allocation.Enable {
+		if p.args.Allocation.Enable && p.clients == nil {
 			p.rememberLease(leaseKey{domain: domain, ip: e.ip}, expires)
 		}
 	}
@@ -373,12 +408,23 @@ func (p *DomainMapping) snapshotContext(ctx context.Context) (Stats, error) {
 		s.BlockedUntil = p.alloc.blockedUntil
 	}
 	s.APIActive, s.APIRejected, s.APITimeouts = p.apiActive.Load(), p.apiRejected.Load(), p.apiTimeouts.Load()
+	if p.clients != nil {
+		s.HistoryComplete = !now.Before(p.clients.guardUntil) && !now.Before(p.clients.incompleteUntil)
+		s.StateHealthy = p.state != nil && !p.state.failed.Load()
+		s.Generation = p.generation
+		s.StartupGuardUntil = p.clients.guardUntil
+		s.Leases = p.clients.pendingCount
+		if p.policy != nil {
+			s.PolicyCacheEntries = p.policy.len()
+		}
+	}
 	return s, ctx.Err()
 }
 
 func (p *DomainMapping) API() *chi.Mux {
 	r := chi.NewRouter()
 	r.Get("/v1/lookup", p.ServeHTTP)
+	r.Get("/v2/lookup", p.serveV2)
 	r.Get("/v1/stats", func(w http.ResponseWriter, req *http.Request) {
 		ctx, done, ok := p.beginAPI(w, req)
 		if !ok {

@@ -54,6 +54,7 @@ type observationIndex struct {
 	expiry    observationHeap
 	order     list.List
 	retention RetentionArgs
+	onRemove  func(*observation)
 }
 
 // Every observation belongs to its client bucket and the global bucket. Each
@@ -90,6 +91,9 @@ func (s *observationIndex) init(size int) {
 }
 
 func (s *observationIndex) remove(o *observation) {
+	if s.onRemove != nil {
+		s.onRemove(o)
+	}
 	delete(s.records, o.key)
 	keys, n := observationBucketKeys(o.key.lookupKey)
 	for i, key := range keys[:n] {
