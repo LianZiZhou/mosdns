@@ -3,8 +3,8 @@ package domain_mapping
 import (
 	"container/heap"
 	"container/list"
+	"context"
 	"net/netip"
-	"sort"
 	"time"
 )
 
@@ -18,9 +18,10 @@ type observationKey struct {
 type observation struct {
 	key observationKey
 	Candidate
-	sequence uint64
-	heapPos  int
-	order    *list.Element
+	sequence     uint64
+	heapPos      int
+	order        *list.Element
+	bucketOrders [2]*list.Element
 }
 
 type observationHeap []*observation
@@ -48,73 +49,54 @@ type observationIndex struct {
 	size     int
 	sequence uint64
 	records  map[observationKey]*observation
-	buckets  map[lookupKey]map[observationKey]*observation
+	buckets  map[lookupKey]*observationBucket
 	expiry   observationHeap
 	order    list.List
+}
+
+// Every observation belongs to its client bucket and the global bucket. Each
+// bucket keeps the same recency order as the index, plus reference counts for
+// distinct domains. Route queries can therefore select and detect conflicts
+// without scanning all records sharing an address.
+type observationBucket struct {
+	order   list.List
+	domains map[string]int
 }
 
 // Candidates are bounded diagnostics, not an exhaustive list of observations.
 // Keep at least two so limiting the list never hides a domain conflict.
 const maxLookupCandidates = 32
 
-// candidateHeap retains the newest observation for each of the newest domains.
-// Its root is the oldest retained candidate, so lookup work and temporary memory
-// do not include sorting or collecting every domain in a large shared-IP bucket.
-type candidateHeap struct {
-	ordered  []*observation
-	byDomain map[string]int
-}
+// A caller may release its lock and check cancellation between expiry batches.
+// All expired observations must be removed before reading route/conflict data.
+const observationExpiryBatch = 128
 
-func (h candidateHeap) Len() int           { return len(h.ordered) }
-func (h candidateHeap) Less(i, j int) bool { return h.ordered[i].sequence < h.ordered[j].sequence }
-func (h candidateHeap) Swap(i, j int) {
-	h.ordered[i], h.ordered[j] = h.ordered[j], h.ordered[i]
-	h.byDomain[h.ordered[i].Domain], h.byDomain[h.ordered[j].Domain] = i, j
-}
-func (h *candidateHeap) Push(v any) {
-	o := v.(*observation)
-	h.byDomain[o.Domain] = len(h.ordered)
-	h.ordered = append(h.ordered, o)
-}
-func (h *candidateHeap) Pop() any {
-	last := len(h.ordered) - 1
-	o := h.ordered[last]
-	h.ordered[last] = nil
-	h.ordered = h.ordered[:last]
-	delete(h.byDomain, o.Domain)
-	return o
-}
-
-func (h *candidateHeap) consider(o *observation) {
-	if pos, exists := h.byDomain[o.Domain]; exists {
-		if o.sequence > h.ordered[pos].sequence {
-			h.ordered[pos] = o
-			heap.Fix(h, pos)
-		}
-		return
+func observationBucketKeys(key lookupKey) ([2]lookupKey, int) {
+	keys := [2]lookupKey{key, {ip: key.ip}}
+	if !key.client.IsValid() {
+		// Without a client address, the client key already is the global key.
+		return keys, 1
 	}
-	if h.Len() < maxLookupCandidates {
-		heap.Push(h, o)
-	} else if o.sequence > h.ordered[0].sequence {
-		delete(h.byDomain, h.ordered[0].Domain)
-		h.ordered[0] = o
-		h.byDomain[o.Domain] = 0
-		heap.Fix(h, 0)
-	}
+	return keys, 2
 }
 
 func (s *observationIndex) init(size int) {
 	s.size = size
 	s.records = make(map[observationKey]*observation)
-	s.buckets = make(map[lookupKey]map[observationKey]*observation)
+	s.buckets = make(map[lookupKey]*observationBucket)
 }
 
 func (s *observationIndex) remove(o *observation) {
 	delete(s.records, o.key)
-	for _, key := range []lookupKey{o.key.lookupKey, {ip: o.key.ip}} {
+	keys, n := observationBucketKeys(o.key.lookupKey)
+	for i, key := range keys[:n] {
 		bucket := s.buckets[key]
-		delete(bucket, o.key)
-		if len(bucket) == 0 {
+		bucket.order.Remove(o.bucketOrders[i])
+		bucket.domains[o.Domain]--
+		if bucket.domains[o.Domain] == 0 {
+			delete(bucket.domains, o.Domain)
+		}
+		if bucket.order.Len() == 0 {
 			delete(s.buckets, key)
 		}
 	}
@@ -123,9 +105,18 @@ func (s *observationIndex) remove(o *observation) {
 }
 
 func (s *observationIndex) expire(now time.Time) {
-	for len(s.expiry) > 0 && !now.Before(s.expiry[0].ExpiresAt) {
+	for !s.expireBatch(now, observationExpiryBatch) {
+	}
+}
+
+// expireBatch removes at most limit expired observations, returning true when
+// none remain. The caller holds the index lock for each batch and must not read
+// selection or domain counts until this reports completion for its lookup time.
+func (s *observationIndex) expireBatch(now time.Time, limit int) bool {
+	for removed := 0; removed < limit && len(s.expiry) > 0 && !now.Before(s.expiry[0].ExpiresAt); removed++ {
 		s.remove(s.expiry[0])
 	}
+	return len(s.expiry) == 0 || now.Before(s.expiry[0].ExpiresAt)
 }
 
 func (s *observationIndex) put(client, ip netip.Addr, candidate Candidate) uint64 {
@@ -139,43 +130,87 @@ func (s *observationIndex) put(client, ip netip.Addr, candidate Candidate) uint6
 		o.Candidate, o.sequence = candidate, s.sequence
 		heap.Fix(&s.expiry, o.heapPos)
 		s.order.MoveToBack(o.order)
+		keys, n := observationBucketKeys(key.lookupKey)
+		for i, bucketKey := range keys[:n] {
+			s.buckets[bucketKey].order.MoveToBack(o.bucketOrders[i])
+		}
 		return 0
 	}
 	var evicted uint64
 	if len(s.records) >= s.size {
-		s.remove(s.order.Front().Value.(*observation))
-		evicted = 1
+		// Writers only clean a bounded expiry batch. If more expired records
+		// remain, reuse their capacity before evicting any live observation.
+		if len(s.expiry) > 0 && !candidate.ObservedAt.Before(s.expiry[0].ExpiresAt) {
+			s.remove(s.expiry[0])
+		} else {
+			s.remove(s.order.Front().Value.(*observation))
+			evicted = 1
+		}
 	}
 	o := &observation{key: key, Candidate: candidate, sequence: s.sequence}
 	o.order = s.order.PushBack(o)
 	s.records[key] = o
 	heap.Push(&s.expiry, o)
-	for _, bucketKey := range []lookupKey{key.lookupKey, {ip: ip}} {
-		if s.buckets[bucketKey] == nil {
-			s.buckets[bucketKey] = make(map[observationKey]*observation)
+	keys, n := observationBucketKeys(key.lookupKey)
+	for i, bucketKey := range keys[:n] {
+		bucket := s.buckets[bucketKey]
+		if bucket == nil {
+			bucket = &observationBucket{domains: make(map[string]int)}
+			s.buckets[bucketKey] = bucket
 		}
-		s.buckets[bucketKey][key] = o
+		o.bucketOrders[i] = bucket.order.PushBack(o)
+		bucket.domains[o.Domain]++
 	}
 	return evicted
 }
 
 func (s *observationIndex) candidates(key lookupKey) []Candidate {
+	result, _ := s.candidatesContext(context.Background(), key)
+	return result
+}
+
+// route returns the latest observation, whether distinct domains conflict, and
+// whether the bucket exists. The caller must first finish expiry at its lookup
+// time; otherwise both selection and conflict could include expired evidence.
+func (s *observationIndex) route(key lookupKey) (candidate Candidate, conflict, found bool) {
 	bucket := s.buckets[key]
-	if len(bucket) == 0 {
-		return []Candidate{}
+	if bucket == nil {
+		return Candidate{}, false, false
 	}
-	capacity := min(maxLookupCandidates, len(bucket))
-	top := candidateHeap{
-		ordered:  make([]*observation, 0, capacity),
-		byDomain: make(map[string]int, capacity),
+	return bucket.order.Back().Value.(*observation).Candidate, len(bucket.domains) > 1, true
+}
+
+// Diagnostics retain the newest observation for up to 32 distinct domains.
+// Repeated records of one domain may still require walking a large bucket; the
+// route view avoids this entirely, and diagnostic walks check cancellation.
+func (s *observationIndex) candidatesContext(ctx context.Context, key lookupKey) ([]Candidate, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	for _, o := range bucket {
-		top.consider(o)
+	bucket := s.buckets[key]
+	if bucket == nil {
+		return []Candidate{}, nil
 	}
-	sort.Slice(top.ordered, func(i, j int) bool { return top.ordered[i].sequence > top.ordered[j].sequence })
-	result := make([]Candidate, 0, len(top.ordered))
-	for _, o := range top.ordered {
+	count := min(maxLookupCandidates, len(bucket.domains))
+	result := make([]Candidate, 0, count)
+	seen := make(map[string]struct{}, count)
+	visited := 0
+	for e := bucket.order.Back(); e != nil && len(result) < count; e = e.Prev() {
+		if visited%observationExpiryBatch == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		visited++
+		o := e.Value.(*observation)
+		if _, exists := seen[o.Domain]; exists {
+			continue
+		}
+		seen[o.Domain] = struct{}{}
 		result = append(result, o.Candidate)
 	}
-	return result
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
 }

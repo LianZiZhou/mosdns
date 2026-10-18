@@ -9,6 +9,9 @@ plugins:
     type: domain_mapping
     args:
       size: 65536
+      api:
+        max_concurrent: 128 # lookup/stats 共用的活动请求上限，超额立即拒绝并尝试返回 503。
+        timeout: 1000 # 毫秒；Mihomo 仍使用自己的 50 ms 查询预算。
       allocation:
         enable: false
         size: 65536

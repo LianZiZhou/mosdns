@@ -8,6 +8,7 @@ through the bridge while protocol sniffing and Mihomo DNS are disabled.
 
 import argparse
 import concurrent.futures
+import http.server
 import ipaddress
 import json
 import os
@@ -21,6 +22,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -30,9 +32,15 @@ ALLOCATED_PORTS = set()
 def free_port():
     # Windows may allow a TCP ephemeral port that is excluded for UDP.
     # Services here use both transports, so verify both before launching.
-    for _ in range(100):
+    for attempt in range(100):
         with socket.socket() as tcp, socket.socket(type=socket.SOCK_DGRAM) as udp:
-            tcp.bind(("127.0.0.1", 0))
+            # TCP's automatic sequence may remain inside a long UDP exclusion
+            # range on Windows. Fall back to independent explicit candidates.
+            candidate = 0 if attempt < 10 else 1024 + int.from_bytes(os.urandom(2), "big") % (65536 - 1024)
+            try:
+                tcp.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
             port = tcp.getsockname()[1]
             if port in ALLOCATED_PORTS:
                 continue
@@ -154,7 +162,11 @@ class DNSHandler(socketserver.BaseRequestHandler):
             address = self.server.policy_address if name == "policy.bridge.test" else "127.0.0.1"
             if name == "previous.bridge.test":
                 address = "203.0.113.100"
-            ttl = 1 if name == "expiry.bridge.test" else 600
+            if name in ("expiry.bridge.test", "expiry-stable.bridge.test"):
+                address = "203.0.113.113"
+            if name == "expiry-only.bridge.test":
+                address = "203.0.113.114"
+            ttl = 2 if name in ("expiry.bridge.test", "expiry-only.bridge.test") else 600
             answer = b"\xc0\x0c" + struct.pack("!HHIH", 1, 1, ttl, 4) + socket.inet_aton(address)
             answer_count = 1
         response = data[:2] + struct.pack("!5H", 0x8180, 1, answer_count, 0, additional_count) + data[12:end + 4] + answer + additional
@@ -272,6 +284,60 @@ def get_json(url, method="GET", value=None):
         raise RuntimeError(f"HTTP {error.code}: {error.read().decode(errors='replace')}") from error
 
 
+def lookup_views(api, ip, client=None):
+    params = {"ip": ip}
+    if client is not None:
+        params["client"] = client
+    url = api + "?" + urllib.parse.urlencode(params)
+    full = get_json(url)
+    route = get_json(url + "&view=route")
+    assert "candidates" not in route, route
+    assert route == {key: value for key, value in full.items() if key != "candidates"}, (full, route)
+    return route
+
+
+class LegacyAPI(http.server.ThreadingHTTPServer):
+    """Simulate v1 before compact views: unknown query fields are ignored."""
+
+    daemon_threads = True
+
+    def __init__(self, api):
+        self.api = api
+        self.calls = 0
+        self.route_requests = 0
+        self.full_responses = 0
+        self.lock = threading.Lock()
+        super().__init__(("127.0.0.1", 0), LegacyAPIHandler)
+
+
+class LegacyAPIHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        with self.server.lock:
+            self.server.calls += 1
+            self.server.route_requests += params.get("view") == ["route"]
+        # Deliberately drop view and forward only fields supported by old MosDNS.
+        legacy_params = {key: params[key][-1] for key in ("ip", "client") if key in params}
+        try:
+            value = get_json(self.server.api + "?" + urllib.parse.urlencode(legacy_params))
+            with self.server.lock:
+                self.server.full_responses += bool(value.get("candidates"))
+            body = json.dumps(value).encode()
+            self.send_response(200)
+        except (OSError, RuntimeError, ValueError) as error:
+            body = json.dumps({"error": str(error)}).encode()
+            self.send_response(502)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_):
+        pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mosdns", required=True, type=Path)
@@ -385,12 +451,38 @@ def main():
         result["response_boundary_regressions"] = "pass"
         print("PASS UDP truncation preserves prior evidence and only related HTTPS Additional is indexed", flush=True)
 
+        # Compact responses must preserve routing evidence and expiry semantics.
+        # Dedicated IPs keep this check independent of echo-server observations.
+        query("expiry-stable.bridge.test", "127.0.0.4")
+        query("expiry.bridge.test", "127.0.0.2")
+        query("expiry-only.bridge.test", "127.0.0.6")
+        scoped_expiry = get_json(api + "?ip=203.0.113.113&client=127.0.0.2&view=route")
+        assert scoped_expiry["domain"] == "expiry.bridge.test" and scoped_expiry["scope"] == "client"
+        global_expiry = get_json(api + "?ip=203.0.113.113&client=127.0.0.5&view=route")
+        assert global_expiry["domain"] == "expiry.bridge.test" and global_expiry["scope"] == "global" and global_expiry["conflict"]
+        deadline = time.monotonic() + 6
+        while True:
+            after = get_json(api + "?ip=203.0.113.113&client=127.0.0.2&view=route")
+            expired = get_json(api + "?ip=203.0.113.114&client=127.0.0.6&view=route")
+            if after.get("domain") == "expiry-stable.bridge.test" and expired["status"] == "miss":
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError(f"expired route evidence retained: {after}, {expired}")
+            time.sleep(0.05)
+        assert after["scope"] == "global" and not after["conflict"]
+        assert lookup_views(api, "203.0.113.113", "127.0.0.2") == after
+        assert lookup_views(api, "203.0.113.114", "127.0.0.6")["status"] == "miss"
+
         query("alpha.bridge.test", "127.0.0.2")
         query("beta.bridge.test", "127.0.0.3")
-        assert get_json(api + "?ip=127.0.0.1&client=127.0.0.2")["domain"] == "alpha.bridge.test"
-        assert get_json(api + "?ip=127.0.0.1&client=127.0.0.3")["domain"] == "beta.bridge.test"
-        fallback = get_json(api + "?ip=127.0.0.1&client=2001:db8::2")
+        assert lookup_views(api, "127.0.0.1", "127.0.0.2")["domain"] == "alpha.bridge.test"
+        scoped_conflict = lookup_views(api, "127.0.0.1", "127.0.0.3")
+        assert scoped_conflict["domain"] == "beta.bridge.test" and scoped_conflict["scope"] == "client" and scoped_conflict["conflict"]
+        fallback = lookup_views(api, "127.0.0.1", "2001:db8::2")
         assert fallback["scope"] == "global" and fallback["conflict"]
+        assert lookup_views(api, "127.0.0.1")["scope"] == "global"
+        result["route_view_regressions"] = "pass"
+        print("PASS compact/full lookup equivalence, client/global conflicts, expiry and fallback", flush=True)
 
         config = {
             "mixed-port": socks_port, "bind-address": "127.0.0.1", "allow-lan": True,
@@ -436,6 +528,20 @@ def main():
         reload_config()
         socks_echo(socks_port, target_port)
         print("PASS provider disable/enable reload", flush=True)
+
+        legacy = LegacyAPI(api)
+        servers.append(legacy)
+        threading.Thread(target=legacy.serve_forever, daemon=True).start()
+        config["domain-mapping"]["providers"][0]["endpoint"] = f"http://127.0.0.1:{legacy.server_address[1]}/plugins/domain_index/v1/lookup"
+        reload_config()
+        socks_echo(socks_port, target_port)
+        socks_echo(socks_port, target_port, client="127.0.0.3", expect_success=False)
+        with legacy.lock:
+            assert legacy.calls >= 2 and legacy.route_requests == legacy.calls and legacy.full_responses == legacy.calls
+        config["domain-mapping"]["providers"][0]["endpoint"] = api
+        reload_config()
+        result["legacy_api_compatibility"] = "pass"
+        print("PASS Mihomo requests compact views and accepts a legacy endpoint returning full JSON", flush=True)
 
         # Stop the DNS process: lookup failure must reach existing protocol sniffing.
         config["sniffer"] = {"enable": True, "parse-pure-ip": True, "override-destination": False, "sniff": {"HTTP": {"ports": [target_port], "override-destination": False}}}
