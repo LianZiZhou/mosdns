@@ -53,7 +53,7 @@ func (ss *serverService) Start(s service.Service) error {
 	}
 	ss.m = m
 	go func() {
-		err := m.GetSafeClose().WaitClosed()
+		err := m.WaitClosed()
 		if err != nil {
 			m.Logger().Fatal("server exited", zap.Error(err))
 		} else {
@@ -66,7 +66,7 @@ func (ss *serverService) Start(s service.Service) error {
 func (ss *serverService) Stop(_ service.Service) error {
 	ss.m.Logger().Info("service is shutting down")
 	ss.m.GetSafeClose().SendCloseSignal(nil)
-	return ss.m.GetSafeClose().WaitClosed()
+	return ss.m.WaitClosed()
 }
 
 // initService will init svc for sub command "service"

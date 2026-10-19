@@ -124,7 +124,7 @@ func (p *DomainMapping) clientCompatible(key lookupKey, domain string, now time.
 
 func (p *DomainMapping) allocateClient(q *query_context.Context, domain string, client netip.Addr, now time.Time) *dns.Msg {
 	a := p.clients
-	if !client.IsValid() || !allocationSafe(q, domain) || a.guard.has(client, netip.Addr{}, domain) {
+	if !client.IsValid() || !allocationSafe(q, domain) {
 		p.stats.Unsafe++
 		return nil
 	}
@@ -146,11 +146,37 @@ func (p *DomainMapping) allocateClient(q *query_context.Context, domain string, 
 	}
 	selected := make(map[netip.Addr]bool)
 	changed := false
-	for _, ips := range families {
+	for family, ips := range families {
 		if len(ips) == 0 {
 			continue
 		}
 		sort.Slice(ips, func(i, j int) bool { return ips[i].Less(ips[j]) })
+		// A later domain's exhausted fallback may share this address. That
+		// does not revoke the original choice and must not spread this domain
+		// across the entire upstream pool on its next lookup.
+		preferred := p.preferences.get(preferenceKey{client: client, domain: domain, ipv6: family == 1})
+		if preferred.IsValid() {
+			for _, ip := range ips {
+				if ip == preferred {
+					selected[ip] = true
+					changed = changed || len(ips) > 1
+					break
+				}
+			}
+			if selected[preferred] {
+				continue
+			}
+		}
+		// Historical alias uncertainty forbids inventing a new assignment.
+		// It does not revoke an existing preference for a currently plain,
+		// safely filterable answer when the selected IP is still available.
+		if a.guard.has(client, netip.Addr{}, domain) {
+			p.stats.Unsafe++
+			for _, ip := range ips {
+				selected[ip] = true
+			}
+			continue
+		}
 		var own, shared, free netip.Addr
 		for _, ip := range ips {
 			key := lookupKey{client: client, ip: ip}
@@ -288,6 +314,7 @@ func (p *DomainMapping) prepareClient(q *query_context.Context) func(*dns.Msg) {
 		return nil
 	}
 	allocated := false
+	preferenceSafe := allocationSafe(q, domain)
 	if replacement := p.allocateClient(q, domain, client, p.now()); replacement != nil {
 		if opt := q.UpstreamOpt(); opt != nil {
 			replacement.Extra = append(replacement.Extra, dns.Copy(opt))
@@ -312,6 +339,10 @@ func (p *DomainMapping) prepareClient(q *query_context.Context) func(*dns.Msg) {
 		}
 		now := p.now()
 		p.observe(domain, client, response, now)
+		var preferences []statePreference
+		if preferenceSafe {
+			preferences = p.rememberClientPreferences(client, domain, response, now)
+		}
 		p.generation++
 		// Complex alias/service topologies are preserved, and their known
 		// names/addresses remain explicitly uncertain rather than exclusive.
@@ -332,6 +363,8 @@ func (p *DomainMapping) prepareClient(q *query_context.Context) func(*dns.Msg) {
 			}
 		}
 		event := stateEventFor(domain, client, evidence, names, uncertain, now)
+		event.RoutingSequence = p.routes.sequence
+		event.Preferences = preferences
 		event.Taints = p.clients.taints
 		p.clients.taints = nil
 		p.state.enqueue(event)

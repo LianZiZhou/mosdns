@@ -22,8 +22,8 @@ package coremain
 import (
 	"fmt"
 	"github.com/IrineSistiana/mosdns/v5/mlog"
-	"github.com/kardianos/service"
 	"github.com/go-viper/mapstructure/v2"
+	"github.com/kardianos/service"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
@@ -70,7 +70,7 @@ func init() {
 				m.logger.Warn("signal received", zap.Stringer("signal", sig))
 				m.sc.SendCloseSignal(nil)
 			}()
-			return m.GetSafeClose().WaitClosed()
+			return m.WaitClosed()
 		},
 		DisableFlagsInUseLine: true,
 		SilenceUsage:          true,

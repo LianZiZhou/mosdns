@@ -264,6 +264,13 @@ func allocationSafe(qCtx *query_context.Context, domain string) bool {
 	if qCtx.QOpt().Do() {
 		return false
 	}
+	return plainResponseSafe(domain, r)
+}
+
+func plainResponseSafe(domain string, r *dns.Msg) bool {
+	if r == nil || r.Rcode != dns.RcodeSuccess || r.Truncated || r.AuthenticatedData || r.CheckingDisabled {
+		return false
+	}
 	for _, section := range [][]dns.RR{r.Answer, r.Ns, r.Extra} {
 		for _, rr := range section {
 			switch rr.(type) {

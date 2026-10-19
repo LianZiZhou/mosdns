@@ -45,7 +45,7 @@ func NewHandler(bp *coremain.BP, entry string, trustedECS ...string) (server.Han
 		Entry:      exec,
 		TrustedECS: prefixes,
 	}
-	return server_handler.NewEntryHandler(handlerOpts), nil
+	return bp.M().TrackDNSHandler(server_handler.NewEntryHandler(handlerOpts)), nil
 }
 
 func parseTrustedECS(values []string) ([]netip.Prefix, error) {

@@ -14,12 +14,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/miekg/dns"
+	"go.uber.org/zap"
 )
 
 const (
@@ -47,21 +50,26 @@ type stateRecord struct {
 	Sequence     uint64    `json:"sequence,omitempty"`
 }
 type stateSnapshot struct {
-	Version           int           `json:"version"`
-	HistoryComplete   bool          `json:"history_complete"`
-	GuardUntil        time.Time     `json:"guard_until,omitempty"`
-	IncompleteUntil   time.Time     `json:"incomplete_until,omitempty"`
-	Generation        uint64        `json:"generation,omitempty"`
-	Guard             []byte        `json:"guard,omitempty"`
-	Records           []stateRecord `json:"records"`
-	IncompleteBuckets []stateKey    `json:"incomplete_buckets,omitempty"`
+	Version           int                 `json:"version"`
+	HistoryComplete   bool                `json:"history_complete"`
+	GuardUntil        time.Time           `json:"guard_until,omitempty"`
+	IncompleteUntil   time.Time           `json:"incomplete_until,omitempty"`
+	Generation        uint64              `json:"generation,omitempty"`
+	Guard             []byte              `json:"guard,omitempty"`
+	Records           []stateRecord       `json:"records"`
+	IncompleteBuckets []stateKey          `json:"incomplete_buckets,omitempty"`
+	Preferences       []statePreference   `json:"preferences,omitempty"`
+	RoutingHints      *[]stateRoutingHint `json:"routing_hints,omitempty"`
+	RoutingSequence   uint64              `json:"routing_sequence,omitempty"`
 }
 type stateEvent struct {
-	Records   []stateRecord `json:"records"`
-	Names     []string      `json:"names,omitempty"`
-	Client    string        `json:"client,omitempty"`
-	Uncertain bool          `json:"uncertain,omitempty"`
-	Taints    []stateKey    `json:"taints,omitempty"`
+	Records         []stateRecord     `json:"records"`
+	Names           []string          `json:"names,omitempty"`
+	Client          string            `json:"client,omitempty"`
+	Uncertain       bool              `json:"uncertain,omitempty"`
+	Taints          []stateKey        `json:"taints,omitempty"`
+	Preferences     []statePreference `json:"preferences,omitempty"`
+	RoutingSequence uint64            `json:"routing_sequence,omitempty"`
 }
 type stateStore struct {
 	p         *DomainMapping
@@ -74,6 +82,7 @@ type stateStore struct {
 	file      *os.File
 	bytes     int64
 	markerMu  sync.Mutex
+	closeErr  error
 }
 
 func stateEventFor(domain string, client netip.Addr, evidence []evidence, names []string, uncertain bool, now time.Time) stateEvent {
@@ -95,6 +104,9 @@ func (p *DomainMapping) openState() (*stateStore, error) {
 	}
 	_, dirtyErr := os.Stat(s.path + ".dirty")
 	dirty := dirtyErr == nil || !errors.Is(dirtyErr, os.ErrNotExist)
+	if dirty {
+		s.logRecovery("dirty_marker", dirtyErr)
+	}
 	snapshot, err := readStateSnapshot(s.path)
 	imported := false
 	if errors.Is(err, os.ErrNotExist) && p.args.Allocation.ImportFile != "" {
@@ -114,7 +126,20 @@ func (p *DomainMapping) openState() (*stateStore, error) {
 			p.index.retention = p.args.Retention
 			p.index.onRemove = p.forgetObservation
 			p.clients = newClientAllocator(p.args.Allocation.Size)
+			p.routes.init(p.args.Routing.Size)
+			p.preferences.init(p.args.Allocation.Size)
+			p.routingRestoreCutoff = 0
+			p.routingRestored = false
 		}
+	}
+	if err != nil {
+		reason := "snapshot_invalid"
+		if errors.Is(err, os.ErrNotExist) {
+			reason = "snapshot_missing"
+		}
+		s.logRecovery(reason, err)
+	} else if !snapshot.HistoryComplete && snapshot.GuardUntil.IsZero() {
+		s.logRecovery("snapshot_incomplete", nil)
 	}
 	if err != nil || dirty || (!snapshot.HistoryComplete && snapshot.GuardUntil.IsZero()) {
 		p.clients.guardUntil = maxTime(p.clients.guardUntil, p.now().Add(time.Duration(p.args.Allocation.StartupGuard)*time.Second))
@@ -123,10 +148,25 @@ func (p *DomainMapping) openState() (*stateStore, error) {
 	if err != nil || dirty {
 		p.clients.incompleteUntil = maxTime(p.clients.incompleteUntil, p.clients.guardUntil)
 	}
+	// Connection LRU touches are deliberately not journaled. After an
+	// interrupted run, replaying DNS alone cannot reconstruct which hints
+	// were evicted. Keep allocation evidence, but start routing cold.
+	discardRouting := dirty || err != nil || (!snapshot.HistoryComplete && snapshot.GuardUntil.IsZero())
+	routingBeforeWAL := p.routes.sequence
 	if walErr := s.replayWAL(); walErr != nil {
+		discardRouting = true
+		s.logRecovery("wal_replay_error", walErr)
 		p.clients.guardUntil = maxTime(p.clients.guardUntil, p.now().Add(time.Duration(p.args.Allocation.StartupGuard)*time.Second))
 		p.clients.recovery = true
 		p.clients.incompleteUntil = maxTime(p.clients.incompleteUntil, p.clients.guardUntil)
+	}
+	if discardRouting || p.routes.sequence != routingBeforeWAL {
+		sequence := p.routes.sequence
+		p.routes.init(p.args.Routing.Size)
+		p.routes.sequence = sequence
+		p.routingRestored = true
+		p.routingRestoreCutoff = sequence
+		s.logger().Info("domain mapping routing cache starts empty after uncertain recovery")
 	}
 	if err := s.markDirty(); err != nil {
 		return nil, fmt.Errorf("persist allocation startup marker: %w", err)
@@ -139,6 +179,23 @@ func (p *DomainMapping) openState() (*stateStore, error) {
 	p.clients.journalReady = true
 	go s.run()
 	return s, nil
+}
+
+func (s *stateStore) logRecovery(reason string, err error) {
+	s.logger().Warn("domain mapping allocation recovery", zap.String("reason", reason), zap.Error(err))
+}
+
+func (s *stateStore) fail(reason string, err error) {
+	if !s.failed.Swap(true) {
+		s.logger().Error("domain mapping state persistence failed", zap.String("reason", reason), zap.Error(err))
+	}
+}
+
+func (s *stateStore) logger() *zap.Logger {
+	if s.p.logger != nil {
+		return s.p.logger
+	}
+	return mlog.L()
 }
 
 func readStateImport(path string) (stateSnapshot, error) {
@@ -217,10 +274,55 @@ func decodeStateSnapshot(reader io.Reader) (stateSnapshot, error) {
 			err = dec.Decode(&s.IncompleteUntil)
 		case "generation":
 			err = dec.Decode(&s.Generation)
+		case "routing_sequence":
+			err = dec.Decode(&s.RoutingSequence)
+		case "routing_hints":
+			tok, err = dec.Token()
+			if err != nil {
+				return s, err
+			}
+			if tok != json.Delim('[') {
+				return s, fmt.Errorf("invalid state routing hints")
+			}
+			hints := make([]stateRoutingHint, 0)
+			for dec.More() {
+				if len(hints) >= 1048576 {
+					return s, fmt.Errorf("too many state routing hints")
+				}
+				var hint stateRoutingHint
+				if err = dec.Decode(&hint); err != nil {
+					return s, err
+				}
+				hints = append(hints, hint)
+			}
+			s.RoutingHints = &hints
+			_, err = dec.Token()
 		case "guard":
 			err = dec.Decode(&s.Guard)
 		case "incomplete_buckets":
 			err = dec.Decode(&s.IncompleteBuckets)
+		case "preferences":
+			tok, err = dec.Token()
+			if err != nil {
+				return s, err
+			}
+			if tok == nil {
+				continue
+			}
+			if tok != json.Delim('[') {
+				return s, fmt.Errorf("invalid state preferences")
+			}
+			for dec.More() {
+				if len(s.Preferences) >= 1048576 {
+					return s, fmt.Errorf("too many state preferences")
+				}
+				var preference statePreference
+				if err = dec.Decode(&preference); err != nil {
+					return s, err
+				}
+				s.Preferences = append(s.Preferences, preference)
+			}
+			_, err = dec.Token()
 		case "records":
 			tok, err = dec.Token()
 			if err != nil {
@@ -271,6 +373,8 @@ func (p *DomainMapping) restoreSnapshot(snapshot stateSnapshot) error {
 	p.clients.incompleteUntil = snapshot.IncompleteUntil
 	p.clients.recovery = p.now().Before(snapshot.GuardUntil) || p.now().Before(snapshot.IncompleteUntil)
 	p.generation = snapshot.Generation
+	p.routingRestored = snapshot.RoutingHints != nil
+	p.routingRestoreCutoff = snapshot.RoutingSequence
 	sort.SliceStable(snapshot.Records, func(i, j int) bool {
 		a, b := snapshot.Records[i], snapshot.Records[j]
 		if a.ObservedAt.Equal(b.ObservedAt) {
@@ -279,9 +383,18 @@ func (p *DomainMapping) restoreSnapshot(snapshot stateSnapshot) error {
 		return a.ObservedAt.Before(b.ObservedAt)
 	})
 	for _, r := range snapshot.Records {
-		if err := p.restoreRecord(r); err != nil {
+		if err := p.restoreRecordWithRouting(r, !p.routingRestored); err != nil {
 			return err
 		}
+	}
+	if snapshot.RoutingHints != nil {
+		if err := p.restoreRouting(*snapshot.RoutingHints); err != nil {
+			return err
+		}
+		p.routes.sequence = snapshot.RoutingSequence
+	}
+	if err := p.restorePreferences(snapshot.Preferences); err != nil {
+		return err
 	}
 	for _, key := range snapshot.IncompleteBuckets {
 		if err := p.restoreTaint(key); err != nil {
@@ -303,6 +416,10 @@ func parseStateClient(s string) (netip.Addr, error) {
 	return ip.Unmap(), nil
 }
 func (p *DomainMapping) restoreRecord(r stateRecord) error {
+	return p.restoreRecordWithRouting(r, true)
+}
+
+func (p *DomainMapping) restoreRecordWithRouting(r stateRecord, restoreRouting bool) error {
 	client, err := parseStateClient(r.Client)
 	if err != nil {
 		return err
@@ -324,6 +441,9 @@ func (p *DomainMapping) restoreRecord(r stateRecord) error {
 	o := p.index.records[key]
 	o.ExpiresAt = maxTime(o.ExpiresAt, r.ExpiresAt)
 	o.baseTTL = max(o.baseTTL, time.Duration(r.BaseTTL))
+	if restoreRouting {
+		p.restoreRoutingHint(r, client, ip)
+	}
 	return nil
 }
 func (p *DomainMapping) restoreTaint(key stateKey) error {
@@ -340,11 +460,15 @@ func (p *DomainMapping) restoreTaint(key stateKey) error {
 	return nil
 }
 func (p *DomainMapping) applyStateEvent(event stateEvent) error {
+	// Compaction can include observations whose WAL events are still queued.
+	// Replaying those events must not resurrect an LRU entry evicted before
+	// the snapshot, or replace its persisted access order with DNS-time order.
+	restoreRouting := !p.routingRestored || (event.RoutingSequence != 0 && event.RoutingSequence > p.routingRestoreCutoff)
 	client, err := parseStateClient(event.Client)
 	if err != nil {
 		return err
 	}
-	if len(event.Records) > 4096 || len(event.Names) > 4096 || len(event.Taints) > 4096 {
+	if len(event.Records) > 4096 || len(event.Names) > 4096 || len(event.Taints) > 4096 || len(event.Preferences) > 4096 {
 		return fmt.Errorf("oversized allocation event")
 	}
 	for _, name := range event.Names {
@@ -358,7 +482,7 @@ func (p *DomainMapping) applyStateEvent(event stateEvent) error {
 		}
 	}
 	for _, r := range event.Records {
-		if err := p.restoreRecord(r); err != nil {
+		if err := p.restoreRecordWithRouting(r, restoreRouting); err != nil {
 			return err
 		}
 		if event.Uncertain {
@@ -370,6 +494,15 @@ func (p *DomainMapping) applyStateEvent(event stateEvent) error {
 	for _, key := range event.Taints {
 		if err := p.restoreTaint(key); err != nil {
 			return err
+		}
+	}
+	if restoreRouting {
+		if err := p.restorePreferences(event.Preferences); err != nil {
+			return err
+		}
+		p.routes.sequence = max(p.routes.sequence, event.RoutingSequence)
+		if p.routingRestored {
+			p.routingRestoreCutoff = event.RoutingSequence
 		}
 	}
 	p.clients.taints = nil
@@ -434,7 +567,7 @@ func (s *stateStore) markDirty() error {
 		err = closeErr
 	}
 	if err == nil {
-		syncDirectory(filepath.Dir(s.path))
+		err = syncDirectory(filepath.Dir(s.path))
 	}
 	return err
 }
@@ -443,7 +576,7 @@ func (s *stateStore) enqueue(event stateEvent) {
 	select {
 	case s.queue <- event:
 	default:
-		s.failed.Store(true)
+		s.fail("queue_overflow", nil)
 		s.p.clients.recovery = true
 		s.p.clients.guardUntil = maxTime(s.p.clients.guardUntil, s.p.now().Add(time.Duration(s.p.args.Allocation.StartupGuard)*time.Second))
 		s.p.clients.incompleteUntil = maxTime(s.p.clients.incompleteUntil, s.p.clients.guardUntil)
@@ -460,7 +593,7 @@ func (s *stateStore) run() {
 				select {
 				case event := <-s.queue:
 					if err := s.appendEvent(event); err != nil {
-						s.failed.Store(true)
+						s.fail("wal_append_error", err)
 					}
 				default:
 					goto drained
@@ -468,25 +601,29 @@ func (s *stateStore) run() {
 			}
 		drained:
 			if s.file != nil {
-				_ = s.file.Sync()
-				_ = s.file.Close()
+				if err := s.file.Sync(); err != nil {
+					s.fail("wal_sync_error", err)
+				}
+				if err := s.file.Close(); err != nil {
+					s.fail("wal_close_error", err)
+				}
 				s.file = nil
 			}
 			return
 		case event := <-s.queue:
 			if err := s.appendEvent(event); err != nil {
-				s.failed.Store(true)
+				s.fail("wal_append_error", err)
 			}
 		case <-ticker.C:
 			if s.file != nil {
 				if err := s.file.Sync(); err != nil {
-					s.failed.Store(true)
+					s.fail("wal_sync_error", err)
 				}
 			}
 		}
 		if s.bytes >= compactWALAt {
 			if err := s.checkpoint(); err != nil {
-				s.failed.Store(true)
+				s.fail("checkpoint_error", err)
 			}
 		}
 	}
@@ -565,6 +702,10 @@ func (s *stateStore) snapshot() stateSnapshot {
 	snapshot.IncompleteUntil = p.clients.incompleteUntil
 	snapshot.HistoryComplete = !p.now().Before(snapshot.GuardUntil) && !p.now().Before(snapshot.IncompleteUntil)
 	snapshot.Generation = p.generation
+	snapshot.Preferences = p.preferenceSnapshot()
+	hints := p.routingSnapshot()
+	snapshot.RoutingHints = &hints
+	snapshot.RoutingSequence = p.routes.sequence
 	p.mu.Unlock()
 	return snapshot
 }
@@ -623,9 +764,14 @@ func (s *stateStore) checkpoint() error {
 	if err = os.Rename(tmpName, s.path); err != nil {
 		return err
 	}
-	syncDirectory(filepath.Dir(s.path))
+	if err = syncDirectory(filepath.Dir(s.path)); err != nil {
+		return err
+	}
 	if s.file != nil {
-		_ = s.file.Close()
+		if err = s.file.Close(); err != nil {
+			s.file = nil
+			return err
+		}
 		s.file = nil
 	}
 	f, err := os.OpenFile(s.path+".wal", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
@@ -650,7 +796,8 @@ func writeStateJSON(writer io.Writer, snapshot stateSnapshot) error {
 		IncompleteUntil time.Time `json:"incomplete_until,omitempty"`
 		Generation      uint64    `json:"generation"`
 		Guard           []byte    `json:"guard"`
-	}{snapshot.Version, snapshot.HistoryComplete, snapshot.GuardUntil, snapshot.IncompleteUntil, snapshot.Generation, snapshot.Guard}
+		RoutingSequence uint64    `json:"routing_sequence,omitempty"`
+	}{snapshot.Version, snapshot.HistoryComplete, snapshot.GuardUntil, snapshot.IncompleteUntil, snapshot.Generation, snapshot.Guard, snapshot.RoutingSequence}
 	header, err := json.Marshal(metadata)
 	if err != nil {
 		return err
@@ -673,7 +820,41 @@ func writeStateJSON(writer io.Writer, snapshot stateSnapshot) error {
 			return err
 		}
 	}
-	if _, err = buf.WriteString("]}\n"); err != nil {
+	if _, err = buf.WriteString("],\"preferences\":["); err != nil {
+		return err
+	}
+	for i, preference := range snapshot.Preferences {
+		if i > 0 {
+			if err = buf.WriteByte(','); err != nil {
+				return err
+			}
+		}
+		if err = enc.Encode(preference); err != nil {
+			return err
+		}
+	}
+	if err = buf.WriteByte(']'); err != nil {
+		return err
+	}
+	if snapshot.RoutingHints != nil {
+		if _, err = buf.WriteString(",\"routing_hints\":["); err != nil {
+			return err
+		}
+		for i, hint := range *snapshot.RoutingHints {
+			if i > 0 {
+				if err = buf.WriteByte(','); err != nil {
+					return err
+				}
+			}
+			if err = enc.Encode(hint); err != nil {
+				return err
+			}
+		}
+		if err = buf.WriteByte(']'); err != nil {
+			return err
+		}
+	}
+	if _, err = buf.WriteString("}\n"); err != nil {
 		return err
 	}
 	return buf.Flush()
@@ -683,32 +864,56 @@ func (p *DomainMapping) Close() error {
 	if p.state == nil {
 		return nil
 	}
-	var closeErr error
 	p.state.closeOnce.Do(func() {
 		p.mu.Lock()
 		p.clients.closing = true
 		p.mu.Unlock()
-		p.clients.inflight.Wait()
+		drained := make(chan struct{})
+		go func() {
+			p.clients.inflight.Wait()
+			close(drained)
+		}()
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+		select {
+		case <-drained:
+		case <-timer.C:
+			p.state.closeErr = errors.New("response finalizers did not drain; allocation state left dirty")
+			p.state.fail("finalizer_drain_timeout", p.state.closeErr)
+			return
+		}
 		if p.policy != nil {
 			p.policy.close()
 		}
 		close(p.state.stop)
 		<-p.state.done
-		closeErr = p.state.checkpoint()
+		p.state.closeErr = p.state.checkpoint()
 		if p.state.file != nil {
-			_ = p.state.file.Close()
+			p.state.closeErr = errors.Join(p.state.closeErr, p.state.file.Close())
 			p.state.file = nil
 		}
 		p.state.markerMu.Lock()
 		p.mu.Lock()
-		if closeErr == nil && !p.clients.late {
-			closeErr = os.Remove(p.state.path + ".dirty")
-			syncDirectory(filepath.Dir(p.state.path))
+		if p.clients.late {
+			p.state.closeErr = errors.Join(p.state.closeErr, errors.New("late response after shutdown began; allocation state left dirty"))
+			p.state.logRecovery("late_close", nil)
+		}
+		if p.state.closeErr == nil {
+			p.state.closeErr = os.Remove(p.state.path + ".dirty")
+			if p.state.closeErr == nil {
+				p.state.closeErr = syncDirectory(filepath.Dir(p.state.path))
+			}
 		}
 		p.mu.Unlock()
 		p.state.markerMu.Unlock()
+		if p.state.closeErr != nil {
+			// A directory fsync can fail after unlink. Recreate the recovery
+			// marker rather than advertising clean state after that failure.
+			p.state.closeErr = errors.Join(p.state.closeErr, p.state.markDirty())
+			p.state.fail("shutdown_checkpoint_error", p.state.closeErr)
+		}
 	})
-	return closeErr
+	return p.state.closeErr
 }
 
 func equalBytes(a, b []byte) bool {
@@ -736,10 +941,16 @@ func (r *byteReader) Read(b []byte) (int, error) {
 	r.off += n
 	return n, nil
 }
-func syncDirectory(path string) {
+func syncDirectory(path string) error {
 	f, err := os.Open(path)
-	if err == nil {
-		_ = f.Sync()
-		_ = f.Close()
+	if err != nil {
+		return err
 	}
+	defer f.Close()
+	// Windows does not expose directory fsync through os.File. File contents
+	// are still synced; Linux/OpenWrt requires and checks directory durability.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	return f.Sync()
 }

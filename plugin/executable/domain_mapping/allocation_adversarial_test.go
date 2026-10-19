@@ -100,8 +100,11 @@ func TestAuditAliasUncertaintySurvivesCleanRestartAndSharing(t *testing.T) {
 	}
 	again := clientPool(t, "target.test", client, 300, "203.0.113.1", "203.0.113.3")
 	q.record(again)
-	if len(answerAddresses(again)) != 2 {
-		t.Fatalf("original target was trimmed after alias association: %v", answerAddresses(again))
+	// The historical alias still excludes this IP from NEW sharing above,
+	// but must not revoke the target's previously finalized singleton choice
+	// when its current response is a plain, safely filterable RRset.
+	if !reflect.DeepEqual(answerAddresses(again), []string{"203.0.113.1"}) {
+		t.Fatalf("historical alias revoked an existing stable preference: %v", answerAddresses(again))
 	}
 }
 

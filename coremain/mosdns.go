@@ -30,7 +30,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"io"
 	"net/http"
 	"net/http/pprof"
 )
@@ -39,7 +38,10 @@ type Mosdns struct {
 	logger *zap.Logger // non-nil logger.
 
 	// Plugins
-	plugins map[string]any
+	plugins     map[string]any
+	pluginOrder []string
+	requests    requestDrain
+	shutdownErr error
 
 	httpMux    *chi.Mux
 	metricsReg *prometheus.Registry
@@ -64,11 +66,29 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 	// This must be called after m.httpMux and m.metricsReg been set.
 	m.initHttpMux()
 
+	// Load plugins.
+
+	// Close all plugins on signal.
+	// From here, call m.sc.SendCloseSignal() if any plugin failed to load.
+	pluginsReady := make(chan struct{})
+	m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
+		go func() {
+			defer done()
+			<-closeSignal
+			<-pluginsReady
+			m.logger.Info("starting shutdown sequences")
+			m.shutdownErr = m.closePlugins(queryDrainTimeout)
+			if m.shutdownErr == nil {
+				m.logger.Info("all plugins were closed")
+			}
+		}()
+	})
+
 	// Start http api server
 	if httpAddr := cfg.API.HTTP; len(httpAddr) > 0 {
 		httpServer := &http.Server{
 			Addr:    httpAddr,
-			Handler: m.httpMux,
+			Handler: m.trackHTTPHandler(m.httpMux),
 		}
 		m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
 			defer done()
@@ -81,42 +101,28 @@ func NewMosdns(cfg *Config) (*Mosdns, error) {
 			case err := <-errChan:
 				m.sc.SendCloseSignal(err)
 			case <-closeSignal:
+				// The shared gate drains active API requests before stateful
+				// plugins close. Close only the server's sockets here.
 				_ = httpServer.Close()
 			}
 		})
 	}
 
-	// Load plugins.
-
-	// Close all plugins on signal.
-	// From here, call m.sc.SendCloseSignal() if any plugin failed to load.
-	m.sc.Attach(func(done func(), closeSignal <-chan struct{}) {
-		go func() {
-			defer done()
-			<-closeSignal
-			m.logger.Info("starting shutdown sequences")
-			for tag, p := range m.plugins {
-				if closer, _ := p.(io.Closer); closer != nil {
-					m.logger.Info("closing plugin", zap.String("tag", tag))
-					_ = closer.Close()
-				}
-			}
-			m.logger.Info("all plugins were closed")
-		}()
-	})
-
 	// Preset plugins
 	if err := m.loadPresetPlugins(); err != nil {
+		close(pluginsReady)
 		m.sc.SendCloseSignal(err)
 		_ = m.sc.WaitClosed()
 		return nil, err
 	}
 	// Plugins from config.
 	if err := m.loadPluginsFromCfg(cfg, 0); err != nil {
+		close(pluginsReady)
 		m.sc.SendCloseSignal(err)
 		_ = m.sc.WaitClosed()
 		return nil, err
 	}
+	close(pluginsReady)
 	m.logger.Info("all plugins are loaded")
 
 	return m, nil
@@ -211,6 +217,7 @@ func (m *Mosdns) loadPresetPlugins() error {
 			return fmt.Errorf("failed to init preset plugin %s, %w", tag, err)
 		}
 		m.plugins[tag] = p
+		m.pluginOrder = append(m.pluginOrder, tag)
 	}
 	return nil
 }

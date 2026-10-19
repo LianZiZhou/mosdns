@@ -116,6 +116,7 @@ func (m *Mosdns) newPlugin(c PluginConfig) error {
 		return fmt.Errorf("failed to init plugin: %w", err)
 	}
 	m.plugins[c.Tag] = p
+	m.pluginOrder = append(m.pluginOrder, c.Tag)
 	return nil
 }
 

@@ -15,10 +15,12 @@ import (
 	"time"
 
 	"github.com/IrineSistiana/mosdns/v5/coremain"
+	"github.com/IrineSistiana/mosdns/v5/mlog"
 	"github.com/IrineSistiana/mosdns/v5/pkg/query_context"
 	"github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence"
 	"github.com/go-chi/chi/v5"
 	"github.com/miekg/dns"
+	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 )
 
@@ -29,6 +31,7 @@ type Args struct {
 	Allocation AllocationArgs `yaml:"allocation"`
 	API        APIArgs        `yaml:"api"`
 	Retention  RetentionArgs  `yaml:"retention"`
+	Routing    RoutingArgs    `yaml:"routing"`
 }
 
 type APIArgs struct {
@@ -95,6 +98,11 @@ type Stats struct {
 	Generation          uint64    `json:"generation,omitempty"`
 	PolicyCacheEntries  int       `json:"policy_cache_entries,omitempty"`
 	StartupGuardUntil   time.Time `json:"startup_guard_until,omitempty"`
+	RoutingHints        int       `json:"routing_hints"`
+	RoutingCapacity     int       `json:"routing_capacity"`
+	RoutingEvictions    uint64    `json:"routing_evictions"`
+	RoutingTouches      uint64    `json:"routing_touches"`
+	Preferences         int       `json:"allocation_preferences"`
 }
 
 type DomainMapping struct {
@@ -112,6 +120,12 @@ type DomainMapping struct {
 	policy      *policyCache
 	state       *stateStore
 	generation  uint64
+	routes      routingCache
+	preferences preferenceCache
+	logger      *zap.Logger
+	// Restore fencing applies only while startup replays snapshot/WAL data.
+	routingRestoreCutoff uint64
+	routingRestored      bool
 }
 
 var _ sequence.RecursiveExecutable = (*DomainMapping)(nil)
@@ -121,7 +135,7 @@ func init() {
 }
 
 func Init(bp *coremain.BP, args any) (any, error) {
-	p, err := New(*args.(*Args))
+	p, err := newWithLogger(*args.(*Args), bp.L())
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +144,13 @@ func Init(bp *coremain.BP, args any) (any, error) {
 }
 
 func New(args Args) (*DomainMapping, error) {
+	return newWithLogger(args, mlog.L())
+}
+
+func newWithLogger(args Args, logger *zap.Logger) (*DomainMapping, error) {
+	if err := args.Routing.normalize(); err != nil {
+		return nil, err
+	}
 	if err := args.Retention.normalize(); err != nil {
 		return nil, err
 	}
@@ -163,10 +184,12 @@ func New(args Args) (*DomainMapping, error) {
 	if args.Allocation.Size == 0 {
 		args.Allocation.Size = args.Size
 	}
-	p := &DomainMapping{args: args, now: time.Now, mu: newContextMutex(), apiSlots: semaphore.NewWeighted(int64(args.API.MaxConcurrent))}
+	p := &DomainMapping{args: args, now: time.Now, mu: newContextMutex(), apiSlots: semaphore.NewWeighted(int64(args.API.MaxConcurrent)), logger: logger}
 	p.index.init(args.Size)
 	p.index.retention = args.Retention
 	p.alloc.init(args.Allocation.Size)
+	p.routes.init(args.Routing.Size)
+	p.preferences.init(args.Allocation.Size)
 	p.stats.AllocationEnabled = args.Allocation.Enable
 	if args.Retention.extended() {
 		p.stats.RetentionMode = args.Retention.Mode
@@ -263,6 +286,9 @@ func (p *DomainMapping) observe(domain string, client netip.Addr, r *dns.Msg, no
 		p.rememberLease(leaseKey{domain: domain}, now.Add(time.Duration(serviceTTL)*time.Second))
 	}
 	for _, e := range evidence {
+		// The native-style routing cache is independent of the retained
+		// ownership history used to make conservative allocation decisions.
+		p.routes.observe(lookupKey{client: client, ip: e.ip}, domain, e.source, now, now.Add(time.Duration(e.ttl)*time.Second))
 		if e.ttl == 0 && !p.args.Retention.extended() {
 			continue
 		}
@@ -403,6 +429,9 @@ func (p *DomainMapping) snapshotContext(ctx context.Context) (Stats, error) {
 	now := p.now()
 	p.alloc.expire(now)
 	s := p.stats
+	s.RoutingHints, s.RoutingCapacity = len(p.routes.entries), p.routes.size
+	s.RoutingEvictions, s.RoutingTouches = p.routes.evictions, p.routes.touches
+	s.Preferences = len(p.preferences.entries)
 	s.Observations, s.Leases = len(p.index.records), len(p.alloc.expiry)
 	if now.Before(p.alloc.blockedUntil) {
 		s.BlockedUntil = p.alloc.blockedUntil
@@ -425,6 +454,7 @@ func (p *DomainMapping) API() *chi.Mux {
 	r := chi.NewRouter()
 	r.Get("/v1/lookup", p.ServeHTTP)
 	r.Get("/v2/lookup", p.serveV2)
+	r.Get("/v3/lookup", p.serveV3)
 	r.Get("/v1/stats", func(w http.ResponseWriter, req *http.Request) {
 		ctx, done, ok := p.beginAPI(w, req)
 		if !ok {
